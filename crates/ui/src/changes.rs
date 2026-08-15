@@ -1188,6 +1188,21 @@ impl Changes {
         changes
     }
 
+    /// A pane born onto a non-default scope (the transcript's turn-summary
+    /// card opens a "Latest turn" tab this way). Unlike a commit pin the
+    /// scope menu stays available — it is an ordinary pane with a head start.
+    pub fn for_scope(state: Entity<AppState>, scope: DiffScope, cx: &mut Context<Self>) -> Self {
+        let mut changes = Self::new(state, cx);
+        changes.scope = scope;
+        changes
+    }
+
+    /// The pane's current scope — lets the shell find an existing
+    /// latest-turn tab instead of stacking duplicates.
+    pub fn scope(&self) -> DiffScope {
+        self.scope
+    }
+
     /// The surface-tab title (contextual, user request): the pinned commit's
     /// subject (short sha for subject-less commits), else the scope's label.
     pub fn tab_title(&self) -> gpui::SharedString {
