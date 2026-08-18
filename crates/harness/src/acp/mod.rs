@@ -26,6 +26,7 @@
 //! - Interrupt: `session/cancel`, escalating SIGTERM → SIGKILL; the stream
 //!   always ends with `Done { status: Interrupted }`.
 
+mod grok_subagent;
 mod normalize;
 
 use std::collections::VecDeque;
@@ -1612,7 +1613,6 @@ fn track_turn_signals(
     }
 }
 
-
 /// A mid-turn `_session/steering` call. `idleBehavior: promptRequired`
 /// covers the turn-ended race: the agent hands the text back instead of
 /// firing an untracked turn.
@@ -1893,6 +1893,12 @@ async fn run_session(session: Session) {
     let mut done_current = false;
     let mut done_after_interrupt = false;
     let mut escalation: Option<tokio::task::JoinHandle<()>> = None;
+    // Grok subagent bookkeeping: spawn tool calls awaiting their subagent
+    // id, and the per-subagent disk-tail tasks feeding tagged events (see
+    // `grok_subagent`). Tails hold an `event_tx` clone, so they are aborted
+    // at run end — a wedged subagent must not keep the event stream open.
+    let mut grok_spawns: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut grok_harvesters: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     // Starved-turn recovery (2026-08-12 stuck-Working incident): a
     // `session/prompt` sent while the agent runs a SELF-CONTINUED turn (a
     // background-task re-invocation no prompt started) starves —
@@ -2017,7 +2023,10 @@ async fn run_session(session: Session) {
                 }
                 // Updates streamed before the prompt response are already
                 // queued in stdout order — fold them into the turn before
-                // closing it (responses bypass the incoming queue).
+                // closing it (responses bypass the incoming queue). With
+                // grok's prompt_complete settlement this drain is the COMMON
+                // path for a turn's tail, so subagent spawns must correlate
+                // here too.
                 let mut consumer_gone = false;
                 while let Ok(inc) = incoming.try_recv() {
                     match inc {
@@ -2027,6 +2036,15 @@ async fn run_session(session: Session) {
                             } else {
                                 Vec::new()
                             };
+                            grok_subagent::scan_notification(
+                                harness,
+                                &method,
+                                &params,
+                                &session_id,
+                                &event_tx,
+                                &mut grok_spawns,
+                                &mut grok_harvesters,
+                            );
                             for ev in events {
                                 if !send(&event_tx, ev).await {
                                     consumer_gone = true;
@@ -2186,6 +2204,21 @@ async fn run_session(session: Session) {
                     } else {
                         Vec::new()
                     };
+                    // Grok subagent spawns are correlated with the on-disk
+                    // transcript (the wire streams subagent interiors
+                    // untagged; the session store is the only attributable
+                    // surface). Mirrored in the turn-settle and
+                    // steer-injection drains — updates the prompt response
+                    // outraced fold there, not here.
+                    grok_subagent::scan_notification(
+                        harness,
+                        &method,
+                        &params,
+                        &session_id,
+                        &event_tx,
+                        &mut grok_spawns,
+                        &mut grok_harvesters,
+                    );
                     for ev in events {
                         track_turn_signals(&ev, &mut turn_content_seen, &mut open_tools);
                         if !send(&event_tx, ev).await {
@@ -2301,6 +2334,15 @@ async fn run_session(session: Session) {
                                     } else {
                                         Vec::new()
                                     };
+                                    grok_subagent::scan_notification(
+                                        harness,
+                                        &method,
+                                        &params,
+                                        &session_id,
+                                        &event_tx,
+                                        &mut grok_spawns,
+                                        &mut grok_harvesters,
+                                    );
                                     for ev in events {
                                         if !send(&event_tx, ev).await {
                                             consumer_gone = true;
@@ -2745,6 +2787,13 @@ async fn run_session(session: Session) {
     // waits the pid, a still-armed SIGTERM/SIGKILL timer would fire at a
     // freed (reusable) pid.
     if let Some(handle) = escalation {
+        handle.abort();
+    }
+    // Subagent tails die with the run: their `event_tx` clones would
+    // otherwise hold the event stream open indefinitely for a subagent
+    // whose terminal marker never lands. The engine's run-end sweep marks
+    // any still-running subagent doc failed.
+    for handle in grok_harvesters {
         handle.abort();
     }
     shutdown_child(&mut child, kill_grace).await;

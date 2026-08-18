@@ -24,7 +24,7 @@ fn str_field(v: &Value, key: &str) -> String {
 }
 
 /// Truncate on a char boundary, marking the cut so the UI can say "truncated".
-fn cap_text(text: &str, cap: usize) -> String {
+pub(crate) fn cap_text(text: &str, cap: usize) -> String {
     if text.len() <= cap {
         return text.to_owned();
     }
@@ -261,6 +261,21 @@ fn typed_call(update: &Value) -> ToolCall {
                 }
             }
         }
+        // Grok's subagent spawn (vendor `_meta` marker): the chip is the
+        // subagent's index — name it, and the tab it opens, after the task
+        // description per the cross-driver `Agent: …` convention. Grok's
+        // mid-run update retitles the call to the BARE description with no
+        // rawInput; the marker rides every shaped update, so the prefix
+        // survives that refresh instead of being clobbered by the fallback
+        // arm.
+        _ if super::grok_subagent::is_spawn(update) => ToolCall::Unknown {
+            name: raw_str("description")
+                .or_else(|| (!title.is_empty()).then(|| title.clone()))
+                .filter(|d| d != "spawn_subagent")
+                .map(|d| format!("Agent: {d}"))
+                .unwrap_or_else(|| "Agent".into()),
+            input: raw.cloned(),
+        },
         _ if raw_str("_toolName").as_deref() == Some("task") => ToolCall::Unknown {
             name: raw_str("description")
                 .filter(|d| d != "Subagent task")
@@ -414,7 +429,6 @@ pub(crate) fn parse_commands(value: Option<&Value>) -> Vec<SlashCommand> {
         })
         .collect()
 }
-
 
 /// `session/request_permission` options (`{optionId, name, kind}`) → the
 /// preferred auto-approve choice: `allow_always` > `allow_once` > first.
@@ -815,5 +829,51 @@ mod tests {
                 },
             }]
         );
+    }
+
+    #[test]
+    fn grok_spawn_names_chip_after_description() {
+        // Verbatim opening shape from a live grok 1.0.4 session: the title
+        // is the bare tool name; the description rides rawInput.
+        let update = json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "call-abc-0",
+            "title": "spawn_subagent",
+            "rawInput": {
+                "description": "Probe sleeper",
+                "prompt": "Run the probe.",
+                "subagent_type": "explore",
+            },
+            "_meta": {
+                "x.ai/tool": { "name": "spawn_subagent", "kind": "task" },
+                "subagentBackground": true,
+            },
+        });
+        let events = map_update(&update);
+        assert!(matches!(
+            &events[0],
+            AgentEvent::ToolCall { id, call: ToolCall::Unknown { name, .. } }
+                if id == "call-abc-0" && name == "Agent: Probe sleeper"
+        ));
+    }
+
+    #[test]
+    fn grok_spawn_retitle_update_keeps_agent_prefix() {
+        // Grok's mid-run update retitles the call to the bare description
+        // (no rawInput); the vendor marker must keep the `Agent: ` genus so
+        // the refresh doesn't clobber the chip name.
+        let update = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call-abc-0",
+            "title": "Probe sleeper",
+            "kind": "other",
+            "_meta": { "x.ai/tool": { "name": "spawn_subagent", "kind": "task" } },
+        });
+        let events = map_update(&update);
+        assert!(matches!(
+            &events[0],
+            AgentEvent::ToolCall { call: ToolCall::Unknown { name, .. }, .. }
+                if name == "Agent: Probe sleeper"
+        ));
     }
 }

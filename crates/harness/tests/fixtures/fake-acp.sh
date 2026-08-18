@@ -122,6 +122,22 @@ case "$promptline" in
   exec sleep 60
   ;;
 
+*scenario:subagent*)
+  # Background subagent spawn, grok shape (live-captured 1.0.4): the spawn
+  # tool completes immediately with the subagent id in rawOutput.text; the
+  # interior NEVER streams on the wire (untagged vendor gap) — the harness
+  # must correlate the id and tail the session store on disk (the test
+  # points ZERON_GROK_SESSIONS_DIR at a seeded temp store). The mid-run
+  # update retitles the call to the bare description, as grok does. Turn
+  # settles eagerly; the script idles before EOF so the tail can finish.
+  update '{"sessionUpdate":"tool_call","toolCallId":"call-sp-1","title":"spawn_subagent","rawInput":{"description":"Read the plan","prompt":"Read /w/PLAN.md and summarize.","subagent_type":"explore"},"_meta":{"x.ai/tool":{"version":1,"name":"spawn_subagent","kind":"task","namespace":"grok_build","label":"Subagent","read_only":false},"subagentBackground":true}}'
+  update '{"sessionUpdate":"tool_call_update","toolCallId":"call-sp-1","title":"Read the plan","kind":"other","_meta":{"x.ai/tool":{"version":1,"name":"spawn_subagent","kind":"task","namespace":"grok_build","label":"Subagent","read_only":false}}}'
+  update '{"sessionUpdate":"tool_call_update","toolCallId":"call-sp-1","status":"completed","rawOutput":{"type":"Text","text":"Subagent started in background.\nsubagent_id: sub-0001\ntype: explore\ndescription: Read the plan"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  sleep 6
+  exit 0
+  ;;
+
 *scenario:happy*)
   update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Hello"}}'
   update '{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"thinking"}}'
