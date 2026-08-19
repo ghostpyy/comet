@@ -968,6 +968,17 @@ fn reveal_target_ix(files: &[FileDiff], path: &str) -> Option<usize> {
         .map(|(ix, _)| ix)
 }
 
+/// Whether a parked file jump can be consumed against the rows on screen.
+/// A matching parsed/active key is necessary but not sufficient while a
+/// scoped refresh is replacing that active capture.
+fn reveal_ready(
+    parsed_key: Option<&str>,
+    active_key: Option<&str>,
+    refresh_inflight: bool,
+) -> bool {
+    !refresh_inflight && parsed_key.zip(active_key).is_some_and(|(a, b)| a == b)
+}
+
 /// Flatten all files into rows + each file's row span (header at
 /// `range.start`, body rows after it). `collapsed(ix)` folds a file to just
 /// its header. `comments` is the whole staged set; each file takes its own
@@ -1107,8 +1118,9 @@ pub struct Changes {
     /// once their tween window elapses.
     fold_settle: Option<Task<()>>,
     /// A file path to scroll into view ([`Self::reveal_file`] — the
-    /// transcript summary card's per-file jump). Applied when rows exist,
-    /// else parked until the next parse lands; consumed either way.
+    /// transcript summary card's per-file jump). Applied only when the parsed
+    /// rows match the active capture and no scoped refresh is in flight;
+    /// otherwise parked until that refreshed capture parses.
     pending_reveal: Option<String>,
     list: ListState,
     /// What the pane diffs against (toolbar dropdown).
@@ -1225,24 +1237,30 @@ impl Changes {
     }
 
     /// Scroll `path`'s file section into view — the transcript summary
-    /// card's per-file jump. Applies immediately when the diff is already
-    /// parsed, else parks until the next parse lands (a freshly-minted tab
-    /// captures its diff async). Consumed on the first parse either way: a
-    /// turn diff WITHOUT the file (a gitignored edit, say) must not scroll
-    /// some unrelated later diff.
+    /// card's per-file jump. Applies immediately when the diff is parsed for
+    /// the CURRENT capture, else parks until the next parse lands (a fresh tab
+    /// captures async; a reused tab may still show the previous turn during
+    /// its refresh). Consumed on the first matching parse either way: a turn
+    /// diff WITHOUT the file (a gitignored edit, say) must not scroll some
+    /// unrelated later diff.
     pub fn reveal_file(&mut self, path: String, cx: &mut Context<Self>) {
         self.pending_reveal = Some(path);
-        if self.parsed.is_some() {
+        let active_key = self.active_diff(cx).map(|diff| self.parse_key(&diff));
+        if reveal_ready(
+            self.parsed.as_ref().map(|parsed| parsed.key.as_str()),
+            active_key.as_deref(),
+            self.scoped_inflight.is_some(),
+        ) {
             self.apply_pending_reveal();
         }
         cx.notify();
     }
 
     fn apply_pending_reveal(&mut self) {
+        let Some(parsed) = &self.parsed else { return };
         let Some(path) = self.pending_reveal.take() else {
             return;
         };
-        let Some(parsed) = &self.parsed else { return };
         if let Some(ix) = reveal_target_ix(&parsed.files, &path)
             && let Some(range) = self.row_ranges.get(ix)
         {
@@ -1696,6 +1714,12 @@ impl Changes {
         let key = self.parse_key(&diff);
         if self.parsed.as_ref().is_some_and(|p| p.key == key) {
             self.sync_comment_rows(cx);
+            // A refreshed capture can legitimately have the same checksum as
+            // the previous one. Its fetch still had to finish before a queued
+            // summary-row reveal was safe to consume.
+            if self.scoped_inflight.is_none() {
+                self.apply_pending_reveal();
+            }
             return;
         }
         // Parse off the render path — patches run to megabytes.
@@ -1749,7 +1773,9 @@ impl Changes {
                     file_count,
                     files: Arc::new(files),
                 });
-                changes.apply_pending_reveal();
+                if changes.scoped_inflight.is_none() {
+                    changes.apply_pending_reveal();
+                }
                 cx.notify();
             })
             .ok();
@@ -4443,5 +4469,13 @@ rename to new_name.rs
         assert_eq!(reveal_target_ix(&files, "/tmp/elsewhere/other.rs"), None);
         // Never a bare-suffix false positive ("main.rs" is not "src/main.rs").
         assert_eq!(reveal_target_ix(&files, "notsrc/main.rs"), None);
+    }
+
+    #[test]
+    fn reveal_waits_for_the_active_refreshed_capture() {
+        assert!(reveal_ready(Some("turn:new"), Some("turn:new"), false));
+        assert!(!reveal_ready(Some("turn:old"), Some("turn:new"), false));
+        assert!(!reveal_ready(Some("turn:old"), Some("turn:old"), true));
+        assert!(!reveal_ready(None, Some("turn:new"), false));
     }
 }
