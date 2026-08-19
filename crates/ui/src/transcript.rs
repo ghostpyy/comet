@@ -1587,8 +1587,9 @@ pub enum TranscriptEvent {
         frozen: bool,
     },
     /// A turn-summary card was clicked: reveal the turn diff in the
-    /// right-hand pane.
-    OpenTurnDiff,
+    /// right-hand pane. `file` carries a clicked file row's path — the pane
+    /// scrolls that file's section into view once its diff lands.
+    OpenTurnDiff { file: Option<String> },
 }
 
 impl gpui::EventEmitter<TranscriptEvent> for Transcript {}
@@ -3982,12 +3983,18 @@ impl Transcript {
             );
 
         let overflow = edits.files.len().saturating_sub(SUMMARY_MAX_FILES);
-        let files = div()
-            .py(px(6.0))
-            .font_family(theme.font_mono.clone())
-            .text_size(px(11.5))
-            .children(edits.files.iter().take(SUMMARY_MAX_FILES).map(|file| {
+        // Each row is its own jump target: click opens the pane scrolled to
+        // THIS file's section (the plain card click — anywhere else — opens
+        // it untargeted).
+        let file_rows: Vec<_> = edits
+            .files
+            .iter()
+            .take(SUMMARY_MAX_FILES)
+            .enumerate()
+            .map(|(ix, file)| {
+                let path = file.path.clone();
                 div()
+                    .id(SharedString::from(format!("{row_id}-f{ix}")))
                     .h(px(OUTPUT_LINE_HEIGHT))
                     .w_full()
                     .min_w_0()
@@ -3995,6 +4002,14 @@ impl Transcript {
                     .flex()
                     .items_center()
                     .gap(px(8.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(crate::theme::ink(0.06)))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.emit(TranscriptEvent::OpenTurnDiff {
+                            file: Some(path.clone()),
+                        });
+                    }))
                     .child(
                         div()
                             .min_w_0()
@@ -4017,7 +4032,13 @@ impl Transcript {
                                 .child(SharedString::from(format!("−{deletions}"))),
                         )
                     })
-            }))
+            })
+            .collect();
+        let files = div()
+            .py(px(6.0))
+            .font_family(theme.font_mono.clone())
+            .text_size(px(11.5))
+            .children(file_rows)
             .when(overflow > 0, |el| {
                 el.child(
                     div()
@@ -4089,7 +4110,7 @@ impl Transcript {
                     })
                     .active(|s| s.bg(crate::theme::ink(0.075)))
                     .on_click(cx.listener(|_, _, _, cx| {
-                        cx.emit(TranscriptEvent::OpenTurnDiff);
+                        cx.emit(TranscriptEvent::OpenTurnDiff { file: None });
                     }))
                     .child(header)
                     .child(body),

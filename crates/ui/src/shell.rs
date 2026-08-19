@@ -1707,8 +1707,9 @@ impl Shell {
     /// right-hand pane. Closed → the pane opens onto a turn-scoped diff tab;
     /// open → the chat's existing "Latest turn" tab activates, else a fresh
     /// one opens (per-commit History tabs set the precedent for minting tabs
-    /// from content clicks).
-    fn show_turn_diff(&mut self, cx: &mut Context<Self>) {
+    /// from content clicks). A clicked file row passes its path through, and
+    /// the pane scrolls that file's section into view once its diff lands.
+    fn show_turn_diff(&mut self, file: Option<String>, cx: &mut Context<Self>) {
         if !self.right_pane_open(cx) {
             self.toggle_right_pane(cx);
         }
@@ -1729,13 +1730,23 @@ impl Shell {
                 _ => false,
             })
             .copied();
-        match existing {
-            Some(surface) => self.set_right_active(surface, cx),
+        let changes = match existing {
+            Some(surface) => {
+                self.set_right_active(surface, cx);
+                match surface {
+                    RightSurface::Diff(id) => self.diffs.get(&id).cloned(),
+                    _ => None,
+                }
+            }
             None => {
                 let changes =
                     cx.new(|cx| Changes::for_scope(self.state.clone(), DiffScope::LatestTurn, cx));
-                self.register_diff_surface(changes, cx);
+                self.register_diff_surface(changes.clone(), cx);
+                Some(changes)
             }
+        };
+        if let (Some(path), Some(changes)) = (file, changes) {
+            changes.update(cx, |changes, cx| changes.reveal_file(path, cx));
         }
     }
 
@@ -1780,7 +1791,7 @@ impl Shell {
                     cx,
                 );
             }
-            TranscriptEvent::OpenTurnDiff => self.show_turn_diff(cx),
+            TranscriptEvent::OpenTurnDiff { file } => self.show_turn_diff(file.clone(), cx),
         }
     }
 

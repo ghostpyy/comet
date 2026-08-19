@@ -28,8 +28,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, App, Context, Entity, FocusHandle, Focusable as _, ListAlignment, ListState,
-    SharedString, Subscription, Task, Window, div, font, list, prelude::*, px,
+    AnyElement, App, Context, Entity, FocusHandle, Focusable as _, ListAlignment, ListOffset,
+    ListState, SharedString, Subscription, Task, Window, div, font, list, prelude::*, px,
 };
 
 use zeron_proto::{Chat, CheckoutDiff, GitHistoryCommit};
@@ -952,6 +952,22 @@ pub fn body_rows(
     rows
 }
 
+/// The file index a transcript summary-card path refers to. Card paths are
+/// the tool calls' — often absolute — while diff paths are repo-relative,
+/// so fall back to suffix matching (the longest relative path wins when
+/// nested names collide).
+fn reveal_target_ix(files: &[FileDiff], path: &str) -> Option<usize> {
+    if let Some(ix) = files.iter().position(|f| f.path == path) {
+        return Some(ix);
+    }
+    files
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| path.ends_with(&format!("/{}", f.path)))
+        .max_by_key(|(_, f)| f.path.len())
+        .map(|(ix, _)| ix)
+}
+
 /// Flatten all files into rows + each file's row span (header at
 /// `range.start`, body rows after it). `collapsed(ix)` folds a file to just
 /// its header. `comments` is the whole staged set; each file takes its own
@@ -1090,6 +1106,10 @@ pub struct Changes {
     /// Sweeps [`DiffRow::FoldingBody`] stand-ins back to steady-state rows
     /// once their tween window elapses.
     fold_settle: Option<Task<()>>,
+    /// A file path to scroll into view ([`Self::reveal_file`] — the
+    /// transcript summary card's per-file jump). Applied when rows exist,
+    /// else parked until the next parse lands; consumed either way.
+    pending_reveal: Option<String>,
     list: ListState,
     /// What the pane diffs against (toolbar dropdown).
     scope: DiffScope,
@@ -1148,6 +1168,7 @@ impl Changes {
             rows: Vec::new(),
             row_ranges: Vec::new(),
             fold_settle: None,
+            pending_reveal: None,
             // Rows are single lines now — a deep overdraw is cheap and keeps
             // fast wheel flicks from outrunning measurement.
             list: ListState::new(0, ListAlignment::Top, px(1024.0)),
@@ -1201,6 +1222,35 @@ impl Changes {
     /// latest-turn tab instead of stacking duplicates.
     pub fn scope(&self) -> DiffScope {
         self.scope
+    }
+
+    /// Scroll `path`'s file section into view — the transcript summary
+    /// card's per-file jump. Applies immediately when the diff is already
+    /// parsed, else parks until the next parse lands (a freshly-minted tab
+    /// captures its diff async). Consumed on the first parse either way: a
+    /// turn diff WITHOUT the file (a gitignored edit, say) must not scroll
+    /// some unrelated later diff.
+    pub fn reveal_file(&mut self, path: String, cx: &mut Context<Self>) {
+        self.pending_reveal = Some(path);
+        if self.parsed.is_some() {
+            self.apply_pending_reveal();
+        }
+        cx.notify();
+    }
+
+    fn apply_pending_reveal(&mut self) {
+        let Some(path) = self.pending_reveal.take() else {
+            return;
+        };
+        let Some(parsed) = &self.parsed else { return };
+        if let Some(ix) = reveal_target_ix(&parsed.files, &path)
+            && let Some(range) = self.row_ranges.get(ix)
+        {
+            self.list.scroll_to(ListOffset {
+                item_ix: range.start,
+                offset_in_item: px(0.0),
+            });
+        }
     }
 
     /// The surface-tab title (contextual, user request): the pinned commit's
@@ -1699,6 +1749,7 @@ impl Changes {
                     file_count,
                     files: Arc::new(files),
                 });
+                changes.apply_pending_reveal();
                 cx.notify();
             })
             .ok();
@@ -4375,5 +4426,22 @@ rename to new_name.rs
         };
         assert!(!sources_match_patch(&file, &response));
         assert!(full_highlights(&file, Lang::Rust, &response).is_none());
+    }
+
+    #[test]
+    fn reveal_target_matches_relative_and_absolute_paths() {
+        let files = parse_patch(PATCH);
+        // Exact relative path — what an ACP harness puts on the tool call.
+        assert_eq!(reveal_target_ix(&files, "src/main.rs"), Some(0));
+        // Absolute tool-call path suffixed by the repo-relative diff path.
+        assert_eq!(
+            reveal_target_ix(&files, "/Users/dev/repo/src/main.rs"),
+            Some(0)
+        );
+        assert_eq!(reveal_target_ix(&files, "/repo/added.txt"), Some(1));
+        // A path the diff doesn't cover (gitignored edit): no target.
+        assert_eq!(reveal_target_ix(&files, "/tmp/elsewhere/other.rs"), None);
+        // Never a bare-suffix false positive ("main.rs" is not "src/main.rs").
+        assert_eq!(reveal_target_ix(&files, "notsrc/main.rs"), None);
     }
 }
