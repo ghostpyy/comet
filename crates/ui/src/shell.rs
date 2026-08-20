@@ -3660,9 +3660,9 @@ impl Shell {
                     .line_height(px(17.0))
                     .child(title),
             )
-            // Line 3 (always): harness brand mark, branch, optional PR badge
-            // pinned right, then the working spinner even further right.
-            // Branch remains the only shrinking item.
+            // Line 3 (always): optional PR badge on the far left, then
+            // harness brand mark, branch, and the working spinner pinned
+            // right. Branch remains the only shrinking item.
             .child(
                 div()
                     .w_full()
@@ -3670,6 +3670,14 @@ impl Shell {
                     .flex_row()
                     .items_center()
                     .gap(px(4.0))
+                    .when_some(change_request, |el, summary| {
+                        el.child(crate::change_requests::pull_request_badge(
+                            format!("chat-pr-{id}").into(),
+                            summary,
+                            crate::change_requests::ChangeRequestBadgeSurface::Sidebar,
+                            theme,
+                        ))
+                    })
                     .when_some(
                         harness.map(crate::pickers::harness_brand_icon),
                         |el, (path, tint)| {
@@ -3698,17 +3706,9 @@ impl Shell {
                                 .child(branch),
                         )
                     })
-                    // Stable invisible spring: keeps the optional PR badge
-                    // and spinner pinned right without changing no-PR paint.
+                    // Stable invisible spring: keeps the optional spinner
+                    // pinned right without changing no-PR paint.
                     .child(div().flex_1().min_w_0())
-                    .when_some(change_request, |el, summary| {
-                        el.child(crate::change_requests::pull_request_badge(
-                            format!("chat-pr-{id}").into(),
-                            summary,
-                            crate::change_requests::ChangeRequestBadgeSurface::Sidebar,
-                            theme,
-                        ))
-                    })
                     // Working rows animate the spinner at the row's
                     // bottom-right (the status word keeps its dot up top).
                     // Queued/Failed rows don't: a spinner would fake progress.
