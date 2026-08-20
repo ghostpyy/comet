@@ -3660,8 +3660,9 @@ impl Shell {
                     .line_height(px(17.0))
                     .child(title),
             )
-            // Line 3 (always): harness brand mark, branch, optional PR badge,
-            // and the working spinner. Branch remains the only shrinking item.
+            // Line 3 (always): harness brand mark, optional PR badge left of
+            // the branch, and the working spinner. Branch remains the only
+            // shrinking item — same order as the composer footer.
             .child(
                 div()
                     .w_full()
@@ -3680,6 +3681,14 @@ impl Shell {
                             )
                         },
                     )
+                    .when_some(change_request, |el, summary| {
+                        el.child(crate::change_requests::pull_request_badge(
+                            format!("chat-pr-{id}").into(),
+                            summary,
+                            crate::change_requests::ChangeRequestBadgeSurface::Sidebar,
+                            theme,
+                        ))
+                    })
                     .when_some(branch, |el, branch| {
                         el.child(
                             icon(icons::GIT_BRANCH)
@@ -3697,8 +3706,8 @@ impl Shell {
                                 .child(branch),
                         )
                     })
-                    // Stable invisible spring: keeps the optional spinner and
-                    // PR badge pinned right without changing no-PR paint.
+                    // Stable invisible spring: keeps the optional spinner
+                    // pinned right without changing no-PR paint.
                     .child(div().flex_1().min_w_0())
                     // Working rows animate the spinner at the row's
                     // bottom-right (the status word keeps its dot up top).
@@ -3713,15 +3722,7 @@ impl Shell {
                                 cx,
                             ))
                         },
-                    )
-                    .when_some(change_request, |el, summary| {
-                        el.child(crate::change_requests::pull_request_badge(
-                            format!("chat-pr-{id}").into(),
-                            summary,
-                            crate::change_requests::ChangeRequestBadgeSurface::Sidebar,
-                            theme,
-                        ))
-                    }),
+                    ),
             )
             .into_any_element()
     }
