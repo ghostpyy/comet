@@ -128,20 +128,29 @@ pub(crate) fn pull_request_badge(
 
     div()
         .id(id)
-        .h(px(if composer { 20.0 } else { 16.0 }))
+        .h(px(if composer { 20.0 } else { 14.0 }))
         .flex_none()
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(if composer { 5.0 } else { 0.0 }))
-        .px(px(if composer { 7.0 } else { 4.0 }))
-        .rounded(px(if composer { 6.0 } else { 4.0 }))
-        .bg(color.opacity(0.08))
-        .text_size(px(if composer { 11.0 } else { 10.0 }))
+        .gap(px(if composer { 5.0 } else { 3.0 }))
+        .when(composer, |element| {
+            element
+                .px(px(7.0))
+                .rounded(px(6.0))
+                .bg(color.opacity(0.08))
+        })
+        .text_size(px(11.0))
         .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(color.opacity(0.85))
         .cursor_pointer()
-        .hover(move |style| style.bg(color.opacity(0.16)).text_color(color))
+        .hover(move |style| {
+            if composer {
+                style.bg(color.opacity(0.16)).text_color(color)
+            } else {
+                style.text_color(color)
+            }
+        })
         .on_click(move |_, _, cx| {
             cx.stop_propagation();
             cx.open_url(&url);
@@ -151,14 +160,12 @@ pub(crate) fn pull_request_badge(
                 .into()
         })
         .tooltip_show_delay(std::time::Duration::from_millis(350))
-        .when(composer, |element| {
-            element.child(
-                crate::icons::icon(crate::icons::PULL_REQUEST)
-                    .size(px(11.0))
-                    .flex_none()
-                    .text_color(color.opacity(0.85)),
-            )
-        })
+        .child(
+            crate::icons::icon(crate::icons::PULL_REQUEST)
+                .size(px(11.0))
+                .flex_none()
+                .text_color(color.opacity(0.85)),
+        )
         // Monospace digits give the badge a stable tabular width as PR numbers change.
         .child(
             div()
