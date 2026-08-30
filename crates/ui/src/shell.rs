@@ -4770,12 +4770,6 @@ impl Shell {
         let action = account_menu_action(self.state.read(cx).workspace_scope, self.sync_flow);
         // Bottom-of-sidebar identity: avatar circle + scope/account label and
         // its secondary status line.
-        let initial: SharedString = user_line
-            .chars()
-            .next()
-            .map(|c| c.to_uppercase().to_string())
-            .unwrap_or_else(|| "?".into())
-            .into();
         let mut trigger = div()
             .id("user-menu")
             .flex_none()
@@ -4815,19 +4809,11 @@ impl Shell {
                 cx.notify();
             }))
             .child(
-                // Avatar: white circle, initial in near-black (zeron user-menu.tsx).
-                div()
-                    .size(px(28.0))
-                    .flex_none()
-                    .rounded_full()
-                    .bg(theme.text)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(crate::typography::ui_rems(12.0))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(theme.bg)
-                    .child(initial),
+                // Was a flat white circle for every account. Seeded on the
+                // account identity rather than the display name, so switching
+                // between a personal and a work login is visible at a glance
+                // and does not change color when the display name does.
+                crate::identity::avatar(&menu_identity, &user_line, 28.0, theme),
             )
             .child(
                 // Name with an optional status line underneath — no chip on the right.

@@ -90,11 +90,7 @@ impl Element for Frosted {
             // strength scales all of them by one factor so their ratios hold.
             let sigma = self.blur_radius * crate::appearance::frost(cx).multiplier();
             window.paint_layer(bounds, |window| {
-                window.paint_backdrop_blur(
-                    bounds,
-                    Corners::all(px(self.corner_radius)),
-                    px(sigma),
-                );
+                window.paint_backdrop_blur(bounds, Corners::all(px(self.corner_radius)), px(sigma));
                 self.child.paint(window, cx);
             });
         } else {

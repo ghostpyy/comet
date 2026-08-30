@@ -771,12 +771,18 @@ impl Shell {
                     this.open_spaces_menu(window, cx);
                 }
             }))
-            .child(
-                icon(icons::FOLDER)
+            // "All spaces" keeps the neutral folder; a selected project gets
+            // its own tile, so the trigger says WHICH project at a glance.
+            .child(match &filter {
+                Some(id) => {
+                    crate::identity::tile(id, label.as_ref(), 16.0, theme).into_any_element()
+                }
+                None => icon(icons::FOLDER)
                     .size(px(16.0))
                     .flex_none()
-                    .text_color(theme.text_muted),
-            )
+                    .text_color(theme.text_muted)
+                    .into_any_element(),
+            })
             // flex_1 pushes the caret to the trigger's right edge and gives
             // long space names a bound to truncate against; the "@ device"
             // tag hugs the name inside it rather than sitting by the caret.
@@ -974,9 +980,21 @@ impl Shell {
                             SpacesMenuRow::Space(id) => filter.as_deref() == Some(id.as_str()),
                             SpacesMenuRow::AddSpace => false,
                         };
-                        let leading = match &row {
-                            SpacesMenuRow::AddSpace => icons::PLUS,
-                            _ => icons::FOLDER,
+                        let leading: AnyElement = match &row {
+                            SpacesMenuRow::Space(id) => {
+                                crate::identity::tile(id, label.as_ref(), 15.0, theme)
+                                    .into_any_element()
+                            }
+                            SpacesMenuRow::AddSpace => icon(icons::PLUS)
+                                .size(px(15.0))
+                                .flex_none()
+                                .text_color(theme.text_muted.opacity(0.8))
+                                .into_any_element(),
+                            SpacesMenuRow::All => icon(icons::FOLDER)
+                                .size(px(15.0))
+                                .flex_none()
+                                .text_color(theme.text_muted.opacity(0.8))
+                                .into_any_element(),
                         };
                         let menu_space = match &row {
                             SpacesMenuRow::Space(id) => Some(id.clone()),
@@ -1002,12 +1020,7 @@ impl Shell {
                                 }),
                             )
                         })
-                        .child(
-                            icon(leading)
-                                .size(px(15.0))
-                                .flex_none()
-                                .text_color(theme.text_muted.opacity(0.8)),
-                        )
+                        .child(leading)
                         .child(div().flex_1().min_w_0().truncate().child(label))
                         .when_some(tag, |el, tag| {
                             el.child(

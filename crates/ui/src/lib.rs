@@ -24,6 +24,7 @@ pub mod edge_fade;
 pub mod frost;
 pub mod history;
 pub mod icons;
+pub mod identity;
 pub mod links;
 pub mod loaders;
 pub mod markdown;

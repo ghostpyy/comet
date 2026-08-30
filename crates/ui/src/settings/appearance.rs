@@ -10,8 +10,8 @@ use gpui::{
 };
 use zeron_theme::vscode::{ImportReport, SourceCompilation};
 use zeron_theme::{
-    AccentPreset, AccentSelection, CustomThemeEntry, CustomThemeStatus, InstallMode,
-    FrostStrength, SurfacePreference, SurfaceTreatment, ThemeRegistry, ThemeSelection,
+    AccentPreset, AccentSelection, CustomThemeEntry, CustomThemeStatus, FrostStrength, InstallMode,
+    SurfacePreference, SurfaceTreatment, ThemeRegistry, ThemeSelection,
 };
 
 use crate::appearance::{self, AppearanceMode};
@@ -528,14 +528,15 @@ fn surface_choice(
     surface: SurfacePreference,
     selected: bool,
 ) -> gpui::Stateful<gpui::Div> {
-    segmented_choice(theme, "appearance-surface", surface_label(surface), selected)
+    segmented_choice(
+        theme,
+        "appearance-surface",
+        surface_label(surface),
+        selected,
+    )
 }
 
-fn frost_choice(
-    theme: &Theme,
-    frost: FrostStrength,
-    selected: bool,
-) -> gpui::Stateful<gpui::Div> {
+fn frost_choice(theme: &Theme, frost: FrostStrength, selected: bool) -> gpui::Stateful<gpui::Div> {
     segmented_choice(theme, "appearance-frost", frost_label(frost), selected)
 }
 
