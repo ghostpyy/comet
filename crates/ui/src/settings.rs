@@ -95,6 +95,13 @@ pub fn init(settings: UiSettings, data_dir: impl Into<PathBuf>, cx: &mut App) {
 }
 
 /// Latest settings, including mutations still inside the debounce window.
+/// Root of the active profile's data directory, for the stores that keep files
+/// beside `ui-settings.json` (see [`crate::identity`]).
+pub fn data_dir(cx: &App) -> Option<PathBuf> {
+    cx.try_global::<SettingsStore>()
+        .map(|store| store.data_dir.clone())
+}
+
 pub fn current(cx: &App) -> UiSettings {
     cx.try_global::<SettingsStore>()
         .map(|store| store.current.clone())
@@ -266,6 +273,12 @@ pub struct UiSettings {
     /// Cmd-, and the user menu return to the last one used rather than always
     /// landing on Devices.
     pub settings_section: crate::shell::SettingsSection,
+    /// Chosen pictures for projects and accounts, keyed as `space:{id}` /
+    /// `user:{id}` and valued by a file name under `{data_dir}/images`.
+    /// Device-local: the registry doc carries no picture field, so an entry
+    /// here is deliberately not synced (see [`crate::identity`]).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub images: std::collections::BTreeMap<String, String>,
     /// Pre-theme settings used `accentColor`. Read it once, migrate to
     /// [`Self::accent`], and never write it again.
     #[serde(default, rename = "accentColor", skip_serializing)]
@@ -305,6 +318,7 @@ impl Default for UiSettings {
             surface: zeron_theme::SurfacePreference::default(),
             frost: zeron_theme::FrostStrength::default(),
             settings_section: crate::shell::SettingsSection::default(),
+            images: std::collections::BTreeMap::new(),
             legacy_accent_color: None,
         }
     }
@@ -812,6 +826,10 @@ mod tests {
             surface: zeron_theme::SurfacePreference::Frosted,
             frost: zeron_theme::FrostStrength::Heavy,
             settings_section: crate::shell::SettingsSection::Appearance,
+            images: std::collections::BTreeMap::from([(
+                "space:space-1".to_string(),
+                "3a7f0c1d9b2e4f56.png".to_string(),
+            )]),
             legacy_accent_color: None,
         };
         settings.save(dir.path()).unwrap();

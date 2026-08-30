@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use zeron_proto::{
     AgentAccount, AgentAccountsSnapshot, AgentLoginMode, AgentLoginPoll, AgentLoginStart,
-    AgentLoginStatus, HarnessId,
+    AgentLoginStatus, AuthState, HarnessId,
 };
 use zeron_rpc::methods;
 
@@ -187,6 +187,8 @@ pub struct AccountsPage {
     /// Account id with an in-flight Switch/Forget.
     busy_account: Option<String>,
     login: Option<LoginFlow>,
+    /// Inline failure from the photo picker (unsupported format, oversize).
+    picture_error: Option<SharedString>,
     error: Option<SharedString>,
     code_input: Entity<ComposerInput>,
     load_task: Option<Task<()>>,
@@ -212,6 +214,7 @@ impl AccountsPage {
             snapshot: Loadable::Idle,
             busy_account: None,
             login: None,
+            picture_error: None,
             error: None,
             code_input,
             load_task: None,
@@ -1098,6 +1101,105 @@ impl AccountsPage {
     /// A ghost account row (zeron settings.agents.tsx `SkeletonRow`): avatar,
     /// email line, two usage-meter ghosts, a badge — same geometry as the real
     /// row so loaded data lands without a layout jump. `dim` fades row two.
+    /// The signed-in Zeron account and its picture. Absent when the runtime is
+    /// local-only or development — there is no account to carry a photo, and a
+    /// disabled control would only invite the question.
+    ///
+    /// Device-local on purpose: the registry doc has no picture field, so this
+    /// is the picture on THIS machine. Said plainly in the helper line rather
+    /// than left for the user to discover on their next device.
+    fn render_identity_card(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use crate::settings::widgets;
+        let user = match self.state.read(cx).auth.clone()? {
+            AuthState::SignedIn { user, .. } | AuthState::NeedsOrganization { user } => user,
+            AuthState::SignedOut => return None,
+        };
+        let name: SharedString = user
+            .name
+            .clone()
+            .unwrap_or_else(|| user.email.clone())
+            .into();
+        let key = crate::identity::user_key(&user.id);
+        let has_picture = crate::identity::picture(&key, cx).is_some();
+        let mark = crate::identity::avatar_for(&key, &user.email, &name, 40.0, theme, cx);
+        let pick_key = key.clone();
+        let clear_key = key.clone();
+
+        Some(
+            widgets::section_card(theme)
+                .child(
+                    widgets::card_row(theme, false)
+                        .child(mark)
+                        .child(
+                            div()
+                                .ml(px(12.0))
+                                .flex_1()
+                                .min_w_0()
+                                .child(widgets::row_title(theme, name.as_ref()))
+                                .child(widgets::meta_line(
+                                    theme,
+                                    vec![
+                                        div()
+                                            .child(SharedString::from(if has_picture {
+                                                "Your photo on this device."
+                                            } else {
+                                                "Add a photo for this device."
+                                            }))
+                                            .into_any_element(),
+                                    ],
+                                )),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .when(has_picture, |row| {
+                                    row.child(
+                                        widgets::ghost_action(theme)
+                                            .id("identity-photo-clear")
+                                            .hover(|s| widgets::ghost_hover(theme, s))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                crate::identity::clear_picture(&clear_key, cx);
+                                                this.picture_error = None;
+                                                cx.notify();
+                                            }))
+                                            .child(SharedString::from("Remove")),
+                                    )
+                                })
+                                .child(
+                                    widgets::ghost_action(theme)
+                                        .id("identity-photo-pick")
+                                        .hover(|s| widgets::ghost_hover(theme, s))
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.picture_error = None;
+                                            crate::identity::pick_picture(
+                                                pick_key.clone(),
+                                                window,
+                                                cx,
+                                                |page, result, _| {
+                                                    page.picture_error = result
+                                                        .err()
+                                                        .map(|e| SharedString::from(e.message()));
+                                                },
+                                            );
+                                        }))
+                                        .child(SharedString::from(if has_picture {
+                                            "Change"
+                                        } else {
+                                            "Add photo"
+                                        })),
+                                ),
+                        ),
+                )
+                .when_some(self.picture_error.clone(), |card, message| {
+                    card.child(widgets::warning_strip(theme, message))
+                })
+                .into_any_element(),
+        )
+    }
+
     fn render_skeleton_row(
         &self,
         _id: (&'static str, usize),
@@ -1431,6 +1533,9 @@ impl Render for AccountsPage {
                          detects the live session, keeps each account backed up, and can \
                          swap between them.",
                     ))
+                    .when_some(self.render_identity_card(&theme, cx), |el, card| {
+                        el.child(card)
+                    })
                     .when_some(self.error.clone(), |el, message| {
                         el.child(
                             widgets::error_strip(&theme, message)

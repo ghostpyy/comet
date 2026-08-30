@@ -254,6 +254,7 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
     }
     cx.clear_key_bindings();
     crate::composer::init(cx);
+    crate::popover::init(cx);
     // Fixed app-level shortcuts (Settings on every platform; ⌘Q quit, ⌘W
     // close, ⌘M minimize, ⌘H hide on macOS) — these back the native menu
     // key equivalents and must survive keymap re-application.
@@ -1076,6 +1077,11 @@ pub struct Shell {
     rename_dialog: Option<RenameChatDialog>,
     /// Chat id awaiting delete confirmation.
     delete_confirm: Option<String>,
+    /// Focus target shared by the confirmation dialogs. They own no input, so
+    /// without focus their `Dismissible` context never reaches the dispatch
+    /// path and Escape would fall through to the route below them. One handle
+    /// is enough: the confirmations are mutually exclusive.
+    modal_focus: gpui::FocusHandle,
     /// Space-row context menu (dropdown rows): (space id, window position).
     space_menu: popover::Popup<(String, Point<Pixels>)>,
     rename_space_dialog: Option<RenameSpaceDialog>,
@@ -1367,6 +1373,7 @@ impl Shell {
             chat_menu: popover::Popup::default(),
             rename_dialog: None,
             delete_confirm: None,
+            modal_focus: cx.focus_handle(),
             space_menu: popover::Popup::default(),
             rename_space_dialog: None,
             delete_space_confirm: None,
@@ -4523,8 +4530,19 @@ impl Shell {
                 (line, Some("Alpha".into()), email)
             }
         };
-        let user_menu =
-            self.render_user_menu(user_line.clone(), trigger_subline, menu_identity, theme, cx);
+        // Keyed on the account id, not the email: changing a work address must
+        // not orphan the picture that was chosen for that account.
+        let user_picture_key = user
+            .as_ref()
+            .map(|u| SharedString::from(crate::identity::user_key(&u.id)));
+        let user_menu = self.render_user_menu(
+            user_line.clone(),
+            trigger_subline,
+            menu_identity,
+            user_picture_key,
+            theme,
+            cx,
+        );
 
         // The space filter lives ABOVE the scroll region (fixed) so its
         // dropdown can float without being clipped by the list's overflow.
@@ -4763,6 +4781,7 @@ impl Shell {
         user_line: SharedString,
         trigger_subline: Option<SharedString>,
         menu_identity: SharedString,
+        picture_key: Option<SharedString>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -4813,7 +4832,13 @@ impl Shell {
                 // account identity rather than the display name, so switching
                 // between a personal and a work login is visible at a glance
                 // and does not change color when the display name does.
-                crate::identity::avatar(&menu_identity, &user_line, 28.0, theme),
+                match &picture_key {
+                    Some(key) => {
+                        crate::identity::avatar_for(key, &menu_identity, &user_line, 28.0, theme, cx)
+                    }
+                    None => crate::identity::avatar(&menu_identity, &user_line, 28.0, theme)
+                        .into_any_element(),
+                },
             )
             .child(
                 // Name with an optional status line underneath — no chip on the right.
@@ -5505,14 +5530,10 @@ impl Shell {
                 window.focus(&dialog.input.focus_handle(cx), cx);
             }
             let input = dialog.input.clone();
-            let card = popover::dialog_card(&theme)
-                .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
-                    if ev.keystroke.key == "escape" {
-                        this.rename_dialog = None;
-                        cx.notify();
-                    }
-                }))
-                .child(popover::dialog_title(&theme, "Rename session"))
+            let card = popover::dismissible(popover::dialog_card(&theme), cx, |this, _| {
+                this.rename_dialog = None;
+            })
+            .child(popover::dialog_title(&theme, "Rename session"))
                 .child(
                     div()
                         .mt(px(12.0))
@@ -5561,8 +5582,15 @@ impl Shell {
                     .and_then(|c| c.title.clone())
                     .unwrap_or_else(|| "New session".into()),
             );
-            let card = popover::dialog_card(&theme)
-                .child(popover::dialog_title(&theme, "Delete session?"))
+            let card = popover::focus_card(
+                popover::dismissible(popover::dialog_card(&theme), cx, |this, _| {
+                    this.delete_confirm = None;
+                }),
+                &self.modal_focus.clone(),
+                window,
+                cx,
+            )
+            .child(popover::dialog_title(&theme, "Delete session?"))
                 .child(div().mt(px(6.0)).child(popover::dialog_body(
                     &theme,
                     format!("\u{201C}{title}\u{201D} will be permanently deleted. This can\u{2019}t be undone."),
