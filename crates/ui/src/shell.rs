@@ -51,6 +51,7 @@ use crate::state::{
     AppState, ConnectionStatus, EngineBootConfig, EngineMode, GatePhase, Indicator, OrgRow,
     format_time_ago, org_name_valid, parse_orgs, sort_memberships,
 };
+use crate::subagent_navigator::AgentTarget;
 use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
 use crate::theme::Theme;
 use crate::transcript::{self, Transcript, TranscriptEvent};
@@ -391,9 +392,6 @@ pub enum RightSurface {
     Picker,
     Diff(u64),
     Terminal(u64),
-    /// A subagent's transcript, read-only (per-subagent viz) — the handle
-    /// keys [`Shell::subagent_tabs`].
-    Subagent(u64),
 }
 
 /// Per-chat panel open flags (zeron parity: `sessionPanels` — the terminal and
@@ -962,15 +960,13 @@ struct OrgGateUi {
     _events: Subscription,
 }
 
-/// One right-pane subagent tab: the doc it shows, its strip title, and the
-/// read-only transcript entity whose drop tears the view down.
-struct SubagentTab {
-    doc_id: String,
-    title: SharedString,
+/// The conversation column, showing one agent instead of the session: a
+/// transcript pinned to that agent's doc. Its feed belongs to the agent rail —
+/// this is only the view, and dropping it tears the view down.
+struct AgentView {
+    doc_id: SharedString,
     transcript: Entity<Transcript>,
-    /// Keeps a frozen-blob fetch alive (it falls back to a live doc watch).
-    _fetch: Option<Task<()>>,
-    /// Spawn chips INSIDE the subagent transcript open their own tabs.
+    /// Spawn chips inside an agent's transcript focus the agents IT spawned.
     _events: Subscription,
 }
 
@@ -1018,10 +1014,9 @@ pub struct Shell {
     /// Event hookups for [`Self::diffs`] (History rows opening commit tabs).
     diff_subs: std::collections::HashMap<u64, Subscription>,
     diff_seq: u64,
-    /// Subagent transcript surfaces by id — each tab a read-only
-    /// [`Transcript`] pinned to its subagent doc.
-    subagent_tabs: std::collections::HashMap<u64, SubagentTab>,
-    subagent_seq: u64,
+    /// The agent the conversation column is showing, when it isn't the
+    /// session. At most one: the rail replaces it rather than stacking tabs.
+    agent_view: Option<AgentView>,
     /// Ordered surface tabs per panel key (drag-reorderable; stale entries —
     /// closed terminals/diffs — are skipped at read time).
     right_tabs: std::collections::HashMap<String, Vec<RightSurface>>,
@@ -1198,7 +1193,7 @@ impl Shell {
         // reply's space below it (notes-app parity).
         let composer_events = cx.subscribe(&composer, {
             let transcript = transcript.clone();
-            move |_this: &mut Shell, _, event: &ComposerEvent, cx| match event {
+            move |this: &mut Shell, _, event: &ComposerEvent, cx| match event {
                 ComposerEvent::Sent {
                     chat_id,
                     message_id,
@@ -1207,9 +1202,10 @@ impl Shell {
                         t.on_own_send(chat_id.clone(), message_id.clone(), cx)
                     });
                 }
+                ComposerEvent::FocusAgent(target) => this.show_agent(target.clone(), cx),
             }
         });
-        // Spawn chips open their subagent's transcript as a right-pane tab.
+        // Spawn chips point the agent rail at the agent they spawned.
         let transcript_events = cx.subscribe(&transcript, Self::on_transcript_event);
         // Working-indicator heartbeat: notify once a second while a session is
         // live so elapsed time and the flavour word stay fresh.
@@ -1307,8 +1303,7 @@ impl Shell {
             diffs: std::collections::HashMap::new(),
             diff_subs: std::collections::HashMap::new(),
             diff_seq: 0,
-            subagent_tabs: std::collections::HashMap::new(),
-            subagent_seq: 0,
+            agent_view: None,
             right_tabs: std::collections::HashMap::new(),
             right_tab_drag: None,
             right_tab_scroll: gpui::ScrollHandle::new(),
@@ -1823,10 +1818,6 @@ impl Shell {
                     .iter()
                     .find(|(k, _, _)| k == tab)
                     .map(|(_, title, _)| (*surface, title.clone())),
-                RightSurface::Subagent(id) => self
-                    .subagent_tabs
-                    .get(id)
-                    .map(|tab| (*surface, tab.title.clone())),
                 RightSurface::Picker => None,
             })
             .collect()
@@ -1901,9 +1892,6 @@ impl Shell {
                     changes.update(cx, |changes, cx| changes.ensure_content(cx));
                 }
             }
-            // The tab's feed (watch or snapshot) runs from open to close —
-            // activation needs no revalidation.
-            RightSurface::Subagent(_) => {}
             RightSurface::Picker => {}
         }
         cx.notify();
@@ -1964,8 +1952,9 @@ impl Shell {
         }
     }
 
-    /// Spawn-chip events from the primary transcript AND from subagent-tab
-    /// transcripts (nested spawns open their own tabs).
+    /// Spawn-chip clicks, from the session's transcript and from an agent's
+    /// alike: the rail owns which agent is on screen, so the chip only names
+    /// one and lets the rail move.
     fn on_transcript_event(
         &mut self,
         _: Entity<Transcript>,
@@ -1974,117 +1963,56 @@ impl Shell {
     ) {
         match event {
             TranscriptEvent::OpenSubagent {
-                chat_id,
                 doc_id,
                 title,
                 frozen,
+                ..
             } => {
-                self.add_subagent_surface(
-                    chat_id.clone(),
-                    doc_id.clone(),
-                    title.clone(),
-                    *frozen,
-                    cx,
-                );
+                let target = AgentTarget::Agent {
+                    doc_id: doc_id.as_str().into(),
+                    title: title.as_str().into(),
+                    frozen: *frozen,
+                };
+                self.composer
+                    .update(cx, |composer, cx| composer.focus_agent(target, cx));
             }
         }
     }
 
-    /// A spawn chip's "Open subagent": focus the existing tab for that doc,
-    /// or open one. `frozen` (subagent done/failed) tries the uploaded
-    /// transcript blob first and falls back to the live doc watch; running
-    /// subagents watch the doc directly.
-    fn add_subagent_surface(
-        &mut self,
-        chat_id: String,
-        doc_id: String,
-        title: String,
-        frozen: bool,
-        cx: &mut Context<Self>,
-    ) {
-        // The chip lives in the conversation column — the pane it opens into
-        // may still be closed.
-        if !self.right_pane_open(cx) {
-            self.toggle_right_pane(cx);
+    /// Swap the conversation column between the session and one agent. The
+    /// rail already started that agent's doc feed; this is the view alone.
+    fn show_agent(&mut self, target: AgentTarget, cx: &mut Context<Self>) {
+        match target {
+            AgentTarget::Main => self.agent_view = None,
+            AgentTarget::Agent { doc_id, frozen, .. } => {
+                if self.agent_view.as_ref().is_some_and(|v| v.doc_id == doc_id) {
+                    return;
+                }
+                // A live agent follows its streaming end (the session
+                // transcript's feel); a finished one reads top-down.
+                let transcript = cx.new(|cx| {
+                    Transcript::for_doc(self.state.clone(), doc_id.to_string(), !frozen, cx)
+                });
+                let events = cx.subscribe(&transcript, Self::on_transcript_event);
+                self.agent_view = Some(AgentView {
+                    doc_id,
+                    transcript,
+                    _events: events,
+                });
+            }
         }
-        if let Some((&id, _)) = self
-            .subagent_tabs
-            .iter()
-            .find(|(_, tab)| tab.doc_id == doc_id)
-        {
-            self.set_right_active(RightSurface::Subagent(id), cx);
-            return;
-        }
-        self.subagent_seq += 1;
-        let id = self.subagent_seq;
-        // A live subagent follows its streaming end (main-transcript feel);
-        // a frozen one reads top-down.
-        let transcript =
-            cx.new(|cx| Transcript::for_doc(self.state.clone(), doc_id.clone(), !frozen, cx));
-        let events = cx.subscribe(&transcript, Self::on_transcript_event);
-        let fetch = if frozen {
-            self.spawn_subagent_snapshot_fetch(&chat_id, &doc_id, cx)
-        } else {
-            self.state
-                .update(cx, |s, cx| s.watch_subagent_doc(doc_id.clone(), cx));
-            None
-        };
-        self.subagent_tabs.insert(
-            id,
-            SubagentTab {
-                doc_id,
-                title: title.into(),
-                transcript,
-                _fetch: fetch,
-                _events: events,
-            },
-        );
-        let key = self.panel_key(cx);
-        self.right_tabs
-            .entry(key)
-            .or_default()
-            .push(RightSurface::Subagent(id));
-        self.set_right_active(RightSurface::Subagent(id), cx);
+        cx.notify();
     }
 
-    /// Fetch a finished subagent's frozen transcript blob
-    /// (`{chat_id}/{doc_id}`); on ANY failure fall back to watching the doc
-    /// — the blob upload is best-effort engine-side.
-    fn spawn_subagent_snapshot_fetch(
-        &self,
-        chat_id: &str,
-        doc_id: &str,
-        cx: &mut Context<Self>,
-    ) -> Option<Task<()>> {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.state
-                .update(cx, |s, cx| s.watch_subagent_doc(doc_id.to_string(), cx));
-            return None;
-        };
-        let blob_ref = format!("{chat_id}/{doc_id}");
-        let state = self.state.clone();
-        let doc_id = doc_id.to_string();
-        Some(cx.spawn(async move |_, cx| {
-            let reply = crate::attachments::call_with_timeout(
-                &engine,
-                cx.background_executor(),
-                methods::FETCH_TOOL_BLOB,
-                serde_json::json!({ "blobRef": blob_ref }),
-                Duration::from_secs(20),
-            )
-            .await;
-            let entries: Option<Vec<zeron_doc::SessionMessageEntry>> = reply.ok().and_then(|v| {
-                let text = v.get("text")?.as_str()?.to_owned();
-                serde_json::from_str(&text).ok()
-            });
-            state.update(cx, |s, cx| {
-                match entries {
-                    Some(entries) => s.set_subagent_snapshot(doc_id, entries),
-                    None => s.watch_subagent_doc(doc_id, cx),
-                }
-                cx.notify();
-            });
-        }))
+    /// The transcript the conversation column is rendering — the focused
+    /// agent's, else the session's. Everything anchored to the column (the
+    /// jump pill, the composer-stack clearance) reads it, so the two can
+    /// never drift apart.
+    fn active_transcript(&self) -> &Entity<Transcript> {
+        match &self.agent_view {
+            Some(view) => &view.transcript,
+            None => &self.transcript,
+        }
     }
 
     /// A surface tab's ✕. The active fallback happens naturally through
@@ -2108,14 +2036,6 @@ impl Shell {
             RightSurface::Terminal(tab) => {
                 let panel = self.right_terminal_panel(cx);
                 panel.update(cx, |panel, cx| panel.close_tab_by_key(tab, window, cx));
-            }
-            RightSurface::Subagent(id) => {
-                // Unwatch drops the watch task — that cancels the engine-side
-                // watch and unpins the subagent doc from the engine LRU.
-                if let Some(tab) = self.subagent_tabs.remove(&id) {
-                    self.state
-                        .update(cx, |s, _| s.unwatch_subagent_doc(&tab.doc_id));
-                }
             }
             RightSurface::Picker => {}
         }
@@ -5518,12 +5438,13 @@ impl Shell {
         let has_spaces = !self.state.read(cx).spaces.is_empty();
         let no_project = self.state.read(cx).no_project;
 
-        // Content outlet: selected chat → transcript; nothing selected → a
-        // bare canvas (the composer stack carries the affordances); no spaces
-        // at all → the onboarding card. The composer sits below the first two
-        // (new-chat mode mints the chat id on first send).
+        // Content outlet: selected chat → transcript (the session's, or the
+        // agent the rail focused); nothing selected → a bare canvas (the
+        // composer stack carries the affordances); no spaces at all → the
+        // onboarding card. The composer sits below the first two (new-chat
+        // mode mints the chat id on first send).
         let outlet: AnyElement = if has_selection {
-            self.transcript.clone().into_any_element()
+            self.active_transcript().clone().into_any_element()
         } else if !has_spaces && !no_project {
             // Onboarding (first boot / after the destructive wipe): no folders
             // to work in yet — one clear affordance.
@@ -5706,7 +5627,8 @@ impl Shell {
         stack_h: f32,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        if !self.transcript.read(cx).jump_button_shown() {
+        let transcript = self.active_transcript().clone();
+        if !transcript.read(cx).jump_button_shown() {
             return None;
         }
         Some(
@@ -5717,7 +5639,7 @@ impl Shell {
                 .right(px(10.0))
                 .flex()
                 .justify_center()
-                .child(self.jump_pill("jump-to-bottom", "jump-pill", self.transcript.clone(), cx))
+                .child(self.jump_pill("jump-to-bottom", "jump-pill", transcript, cx))
                 .into_any_element(),
         )
     }
@@ -5994,42 +5916,6 @@ impl Shell {
                     });
                     panel.into_any_element()
                 }
-                RightSurface::Subagent(id) if self.subagent_tabs.contains_key(&id) => {
-                    let transcript = self
-                        .subagent_tabs
-                        .get(&id)
-                        .expect("checked")
-                        .transcript
-                        .clone();
-                    // The pane hosts its own jump pill: the conversation
-                    // overlay's is bound to the PRIMARY transcript, and this
-                    // one anchors to the pane (no composer stack to clear).
-                    let pill = transcript.read(cx).jump_button_shown().then(|| {
-                        div()
-                            .absolute()
-                            .bottom(px(16.0))
-                            .left_0()
-                            .right_0()
-                            .flex()
-                            .justify_center()
-                            .child(self.jump_pill(
-                                "subagent-jump-to-bottom",
-                                "subagent-jump-pill",
-                                transcript.clone(),
-                                cx,
-                            ))
-                    });
-                    // Read-only surface: the transcript fills the pane — no
-                    // composer, no status strip.
-                    div()
-                        .size_full()
-                        .relative()
-                        .flex()
-                        .flex_col()
-                        .child(div().flex_1().min_h_0().child(transcript))
-                        .children(pill)
-                        .into_any_element()
-                }
                 _ => self.render_surface_picker(cx),
             }
         } else {
@@ -6302,22 +6188,7 @@ impl Shell {
             let is_active = surface == active;
             let icon_path = match surface {
                 RightSurface::Diff(_) => icons::GIT_BRANCH,
-                RightSurface::Subagent(_) => icons::BOT,
                 _ => icons::TERMINAL,
-            };
-            // A live subagent tab swaps its icon for the mini working
-            // spinner (the history fetch button's in-flight recipe) — the
-            // doc's streaming tail entry IS the run's liveness, so the swap
-            // settles by itself when the subagent finishes.
-            let subagent_running = match surface {
-                RightSurface::Subagent(id) => self.subagent_tabs.get(&id).is_some_and(|tab| {
-                    self.state
-                        .read(cx)
-                        .sub_transcript(&tab.doc_id)
-                        .last()
-                        .is_some_and(|e| e.status == Some(zeron_doc::MessageStatus::Streaming))
-                }),
-                _ => false,
             };
             // t3 tab hover: the surface icon swaps IN PLACE for the close ✕
             // (same slot, no width jump) — the ✕ only shows while the tab is
@@ -6398,25 +6269,11 @@ impl Shell {
                                 .items_center()
                                 .justify_center()
                                 .group_hover(group.clone(), |s| s.opacity(0.0))
-                                .child(if subagent_running {
-                                    loaders::mini_glyph_spinner(
-                                        format!("subagent-tab-{ix}"),
-                                        2.0,
-                                        theme.glyph,
-                                        cx.entity_id(),
-                                        cx,
-                                    )
-                                    .into_any_element()
+                                .child(icon(icon_path).size(px(12.0)).text_color(if is_active {
+                                    theme.text_muted
                                 } else {
-                                    icon(icon_path)
-                                        .size(px(12.0))
-                                        .text_color(if is_active {
-                                            theme.text_muted
-                                        } else {
-                                            theme.text_muted.opacity(0.7)
-                                        })
-                                        .into_any_element()
-                                }),
+                                    theme.text_muted.opacity(0.7)
+                                })),
                         )
                         .child(
                             div()
@@ -7520,10 +7377,21 @@ impl Render for Shell {
                 // `render_main`), so only the chrome above it overlaps.
                 let term_h = self.eval_tween(self.terminal_tween, self.terminal_target(cx));
                 let stack_h = (self.bottom_stack.get() - term_h).max(0.0);
+                // Both transcripts take the measurements: the session's keeps
+                // its scroll state warm behind an agent view, and an agent view
+                // sits in the same column under the same chrome.
+                let rail_on = rail::rail_visible(main_width);
+                let agent = self.agent_view.as_ref().map(|view| view.transcript.clone());
                 self.transcript.update(cx, |t, cx| {
-                    t.set_rail_enabled(rail::rail_visible(main_width), cx);
+                    t.set_rail_enabled(rail_on, cx);
                     t.set_bottom_clearance(stack_h, cx);
                 });
+                if let Some(agent) = agent {
+                    agent.update(cx, |t, cx| {
+                        t.set_rail_enabled(rail_on, cx);
+                        t.set_bottom_clearance(stack_h, cx);
+                    });
+                }
 
                 let sidebar = self.render_sidebar(cx);
                 let sidebar_handle = self.resize_handle(

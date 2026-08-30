@@ -518,9 +518,11 @@ impl Pickers {
                 cx.notify();
             }
             ComposerInputEvent::Submitted => this.on_search_submit(cx),
-            // Pasted images/files don't apply to a search box.
+            // Pasted images/files don't apply to a search box, and ↓ off the
+            // end of a one-line filter belongs to the picker's own row walk.
             ComposerInputEvent::PastedImages(_)
             | ComposerInputEvent::PastedPaths(_)
+            | ComposerInputEvent::ExitDown
             | ComposerInputEvent::CursorMoved
             | ComposerInputEvent::ViewportChanged
             | ComposerInputEvent::MentionNavigate(_)
