@@ -115,11 +115,25 @@ pub fn format_reset(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Opt
 }
 
 /// The provider cards, in display order: (harness, name, CLI command — named
-/// in the empty-state copy, zeron settings.agents.tsx `PROVIDERS`).
+/// in the empty-state copy, zeron settings.agents.tsx `PROVIDERS`). The name
+/// comes from [`crate::pickers::harness_label`] so these section headers and
+/// every other place that names a harness cannot drift apart.
 pub const PROVIDERS: [(HarnessId, &str, &str); 3] = [
-    (HarnessId::ClaudeCode, "Claude Code", "claude"),
-    (HarnessId::Codex, "Codex", "codex"),
-    (HarnessId::Cursor, "Cursor", "cursor-agent"),
+    (
+        HarnessId::ClaudeCode,
+        crate::pickers::harness_label(HarnessId::ClaudeCode),
+        "claude",
+    ),
+    (
+        HarnessId::Codex,
+        crate::pickers::harness_label(HarnessId::Codex),
+        "codex",
+    ),
+    (
+        HarnessId::Cursor,
+        crate::pickers::harness_label(HarnessId::Cursor),
+        "cursor-agent",
+    ),
 ];
 
 /// Accounts of one provider, in the engine's order (slot creation). No
@@ -1191,24 +1205,15 @@ impl Render for AccountsPage {
         // listeners, which rules out holding a borrow of the shared state.
         let snapshot = self.snapshot(cx).clone();
         let refreshing = matches!(snapshot, Loadable::Loading);
-        let account_count = snapshot.ready().map(|s| s.accounts.len()).filter(|&n| n > 0);
+        let account_count = snapshot
+            .ready()
+            .map(|s| s.accounts.len())
+            .filter(|&n| n > 0);
 
-        let provider_icon = |harness: HarnessId| match harness {
-            HarnessId::Codex => (crate::icons::OPENAI_MARK, None),
-            HarnessId::Cursor => (crate::icons::CURSOR_MARK, None),
-            HarnessId::Grok => (crate::icons::GROK_MARK, None),
-            HarnessId::Hermes => (crate::icons::HERMES_MARK, None),
-            HarnessId::Pi => (crate::icons::PI_MARK, None),
-            HarnessId::Opencode => (crate::icons::OPENCODE_MARK, None),
-            _ => (
-                crate::icons::CLAUDE_MARK,
-                Some(crate::icons::claude_brand()),
-            ),
-        };
         // Brand mark inside a 24px centered box (zeron: `grid size-6
         // place-items-center [&_svg]:size-4`).
         let provider_mark = |harness: HarnessId, theme: &Theme| {
-            let (mark, tint) = provider_icon(harness);
+            let (mark, tint) = crate::pickers::harness_brand_icon(harness);
             div()
                 .flex_none()
                 .size(px(24.0))

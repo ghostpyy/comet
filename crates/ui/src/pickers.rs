@@ -3799,6 +3799,22 @@ pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gp
     }
 }
 
+/// Product name for a harness — the one spelling shown anywhere in the UI
+/// (provider sections, the sidebar usage pill). Sibling of
+/// [`harness_brand_icon`]: mark and name are chosen together.
+pub(crate) const fn harness_label(harness: HarnessId) -> &'static str {
+    match harness {
+        HarnessId::ClaudeCode => "Claude Code",
+        HarnessId::Codex => "Codex",
+        HarnessId::Cursor => "Cursor",
+        HarnessId::Grok => "Grok",
+        HarnessId::Hermes => "Hermes",
+        HarnessId::Pi => "Pi",
+        HarnessId::Opencode => "opencode",
+        HarnessId::Mock => "Mock",
+    }
+}
+
 /// `ZERON_HARNESS=mock` (the e2e/dev rig) opts the mock harness into the UI;
 /// production launches never set it, so the mock never surfaces there.
 fn mock_harness_enabled() -> bool {
