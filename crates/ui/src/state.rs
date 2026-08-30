@@ -661,6 +661,11 @@ pub struct AppState {
     /// the engine LRU — closing a tab MUST go through
     /// [`Self::unwatch_subagent_doc`].
     sub_watch_tasks: HashMap<String, Task<()>>,
+    /// Bumped by every write to [`Self::transcript`] or [`Self::sub_transcripts`].
+    /// Views that fold the rows into a derived collection (the agent rail's
+    /// spawn list) memoize behind it instead of rescanning the whole transcript
+    /// on each of the ~8 commits a second a live run produces.
+    docs_revision: u64,
 }
 
 impl Default for AppState {
@@ -702,6 +707,7 @@ impl AppState {
             change_requests_visible: true,
             sub_transcripts: HashMap::new(),
             sub_watch_tasks: HashMap::new(),
+            docs_revision: 0,
             auto_selected: false,
             chats_synced: false,
             spaces_synced: false,
@@ -762,6 +768,7 @@ impl AppState {
             self.transcript.clear();
             self.transcript_replayed = false;
             self.transcript_task = None;
+            self.bump_docs();
         }
     }
 
@@ -923,6 +930,7 @@ impl AppState {
         }
         self.transcript = entries;
         self.transcript_replayed = true;
+        self.bump_docs();
         self.ack_pending_send_from_transcript();
     }
 
@@ -933,7 +941,11 @@ impl AppState {
         frame: TranscriptFrame,
     ) -> Result<(), TranscriptDesync> {
         let is_reset = matches!(&frame, TranscriptFrame::Reset { .. });
-        zeron_doc::apply_transcript_frame(&mut self.transcript, frame)?;
+        // Bump either way: a desync leaves the rows in an unknown shape, and a
+        // revision that only moves on success would keep a stale memo alive.
+        let applied = zeron_doc::apply_transcript_frame(&mut self.transcript, frame);
+        self.bump_docs();
+        applied?;
         if is_reset {
             self.transcript_replayed = true;
         }
@@ -956,6 +968,30 @@ impl AppState {
             .unwrap_or(&[])
     }
 
+    /// Monotonic across every transcript write — the memo key for collections
+    /// derived from the rows. Equal revisions mean equal rows.
+    pub fn docs_revision(&self) -> u64 {
+        self.docs_revision
+    }
+
+    fn bump_docs(&mut self) {
+        self.docs_revision = self.docs_revision.wrapping_add(1);
+    }
+
+    /// Apply a subagent doc's delta frame in place. `None` = the key is gone (a
+    /// stale pump racing unwatch or a frozen snapshot); the inner `Err` means
+    /// this copy diverged and the watch must resubscribe.
+    fn apply_sub_frame(
+        &mut self,
+        doc_id: &str,
+        frame: TranscriptFrame,
+    ) -> Option<Result<(), TranscriptDesync>> {
+        let rows = self.sub_transcripts.get_mut(doc_id)?;
+        let applied = zeron_doc::apply_transcript_frame(rows, frame);
+        self.bump_docs();
+        Some(applied)
+    }
+
     /// Watch a SUBAGENT doc (`WatchDocMessages` works for any doc id).
     /// Single-flight per key; a frozen snapshot already in place wins — the
     /// watch would race the (complete) blob with a possibly-purged live doc.
@@ -975,7 +1011,9 @@ impl AppState {
     /// unpins the doc from the engine LRU) and the rows.
     pub fn unwatch_subagent_doc(&mut self, doc_id: &str) {
         self.sub_watch_tasks.remove(doc_id);
-        self.sub_transcripts.remove(doc_id);
+        if self.sub_transcripts.remove(doc_id).is_some() {
+            self.bump_docs();
+        }
     }
 
     /// Frozen-blob path: the finished subagent's uploaded transcript, no
@@ -983,6 +1021,7 @@ impl AppState {
     pub fn set_subagent_snapshot(&mut self, doc_id: String, entries: Vec<SessionMessageEntry>) {
         self.sub_watch_tasks.remove(&doc_id);
         self.sub_transcripts.insert(doc_id, entries);
+        self.bump_docs();
     }
 
     /// Add an optimistic user echo (composer send path).
@@ -1373,6 +1412,9 @@ impl AppState {
         self.spaces_synced = false;
         self.transcript.clear();
         self.transcript_replayed = false;
+        self.sub_transcripts.clear();
+        self.sub_watch_tasks.clear();
+        self.bump_docs();
         self.echoes.clear();
         self.pending_sends.clear();
         self.upload_progress = None;
@@ -1585,6 +1627,7 @@ impl AppState {
         self.transcript.clear();
         self.transcript_replayed = false;
         self.transcript_task = None;
+        self.bump_docs();
         if let Some(id) = chat_id.as_deref() {
             // A chat implies its project (or the lack of one); `select_chat(None)`
             // (the new-session canvas) keeps the current project pick.
@@ -2047,8 +2090,8 @@ fn spawn_subagent_watch(
                 let mut desync = false;
                 let alive = this.update(cx, |state, cx| {
                     // A stale pump racing a snapshot/unwatch finds no key.
-                    if let Some(rows) = state.sub_transcripts.get_mut(&doc_id) {
-                        if let Err(err) = zeron_doc::apply_transcript_frame(rows, frame) {
+                    if let Some(applied) = state.apply_sub_frame(&doc_id, frame) {
+                        if let Err(err) = applied {
                             tracing::warn!(%doc_id, error = %err, "resubscribing subagent watch");
                             desync = true;
                         }
