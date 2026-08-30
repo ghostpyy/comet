@@ -1074,6 +1074,13 @@ pub struct Shell {
     /// it (a row's FIRST appearance never chimes, so boot stays silent).
     sound_prev: std::collections::HashMap<String, zeron_proto::SessionStatus>,
     user_menu: popover::Popup<()>,
+    /// Sidebar usage pill, under the user menu.
+    account_usage: Entity<crate::account_usage::AccountUsagePill>,
+    /// Heartbeat that re-renders once per usage TTL so the pill's staleness
+    /// check runs while nothing else is changing. Dropped whenever the pill
+    /// has nothing to show or the window loses focus — see
+    /// [`Shell::drive_account_usage`].
+    account_usage_poll: Option<Task<()>>,
     /// Inline sidebar error strip (mutation failures); click dismisses.
     sidebar_notice: Option<SharedString>,
     /// Local lifecycle of an in-app update (macOS bundle swap) — the engine's
@@ -1182,6 +1189,7 @@ pub struct Shell {
     _ticker: Task<()>,
     _state_observation: Subscription,
     _composer_events: Subscription,
+    _account_usage_events: Subscription,
     /// The primary transcript's spawn-chip events (subagent tabs).
     _transcript_events: Subscription,
 }
@@ -1209,6 +1217,17 @@ impl Shell {
                 }
             }
         });
+        let account_usage =
+            cx.new(|cx| crate::account_usage::AccountUsagePill::new(state.clone(), cx));
+        // "Manage accounts" in the pill's card lands on the page that owns
+        // switching and forgetting, rather than duplicating them in a popover.
+        let account_usage_events = cx.subscribe(
+            &account_usage,
+            |this: &mut Shell, _, _: &crate::account_usage::OpenAccountSettings, cx| {
+                this.route = Route::Settings(SettingsSection::Agents);
+                cx.notify();
+            },
+        );
         // Spawn chips open their subagent's transcript as a right-pane tab.
         let transcript_events = cx.subscribe(&transcript, Self::on_transcript_event);
         // Working-indicator heartbeat: notify once a second while a session is
@@ -1338,6 +1357,8 @@ impl Shell {
             space_boot_applied: false,
             sound_prev: std::collections::HashMap::new(),
             user_menu: popover::Popup::default(),
+            account_usage,
+            account_usage_poll: None,
             sidebar_notice: None,
             update_flow: UpdateFlow::Idle,
             update_task: None,
@@ -1387,6 +1408,7 @@ impl Shell {
             _ticker: ticker,
             _state_observation: observation,
             _composer_events: composer_events,
+            _account_usage_events: account_usage_events,
             _transcript_events: transcript_events,
         }
     }
@@ -4429,8 +4451,56 @@ impl Shell {
                         .child(notice),
                 )
             })
-            .child(div().p(px(Theme::SPACE_SM)).flex_none().child(user_menu))
+            .child(
+                div()
+                    .p(px(Theme::SPACE_SM))
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(user_menu)
+                    .child(self.account_usage.clone()),
+            )
             .into_any_element()
+    }
+
+    /// Keep the sidebar pill's numbers current without probing providers for
+    /// a pill nobody can see.
+    ///
+    /// Three gates, cheapest first: the pill is hidden unless a chat is open,
+    /// a background window is not worth provider traffic, and a snapshot
+    /// younger than the engine's usage TTL would only re-serve its own cache.
+    /// Past those, the heartbeat re-renders once per TTL so this check runs
+    /// again while the app sits idle.
+    fn drive_account_usage(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let showing = self
+            .state
+            .read(cx)
+            .selected_chat_row()
+            .and_then(|c| c.config.as_ref())
+            .is_some();
+        if !showing || !window.is_window_active() {
+            self.account_usage_poll = None;
+            return;
+        }
+        if self.state.read(cx).agent_usage_stale() {
+            self.state
+                .update(cx, |state, cx| state.load_agent_accounts(None, true, cx));
+        }
+        if self.account_usage_poll.is_none() {
+            self.account_usage_poll = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(AppState::AGENT_USAGE_TTL)
+                        .await;
+                    // The refresh decision lives in one place (above); the
+                    // heartbeat only asks for another pass at it.
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
     }
 
     /// Update strip: shown above the user menu whenever the engine's
@@ -7356,9 +7426,14 @@ impl Render for Shell {
                     if !window.is_window_active() {
                         this.set_jump_hints(false, cx);
                     }
+                    // Tears the usage heartbeat down on blur and picks it back
+                    // up on focus (with a refresh if the snapshot went stale
+                    // while away).
+                    this.drive_account_usage(window, cx);
                 },
             ));
         }
+        self.drive_account_usage(window, cx);
 
         // Keyboard shortcuts (mod-s/b/j) dispatch through the window focus
         // chain — with nothing focused they go dead. Land initial focus on the
