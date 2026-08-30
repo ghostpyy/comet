@@ -183,13 +183,11 @@ pub struct AccountsPage {
     /// accounts RPCs are relay-forwardable, CLI logins are per-device).
     target_device: Option<String>,
     device_menu: popover::Popup<()>,
-    snapshot: Loadable<AgentAccountsSnapshot>,
     /// Account id with an in-flight Switch/Forget.
     busy_account: Option<String>,
     login: Option<LoginFlow>,
     error: Option<SharedString>,
     code_input: Entity<ComposerInput>,
-    load_task: Option<Task<()>>,
     action_task: Option<Task<()>>,
     poll_task: Option<Task<()>>,
     _observe: Subscription,
@@ -209,12 +207,10 @@ impl AccountsPage {
             state,
             target_device: None,
             device_menu: popover::Popup::default(),
-            snapshot: Loadable::Idle,
             busy_account: None,
             login: None,
             error: None,
             code_input,
-            load_task: None,
             action_task: None,
             poll_task: None,
             _observe: observe,
@@ -427,31 +423,18 @@ impl AccountsPage {
         trigger.into_any_element()
     }
 
+    /// Delegate to the shared snapshot on [`AppState`], so this page and any
+    /// other reader of the same accounts cost one provider probe between them.
     fn load(&mut self, force_usage: bool, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.snapshot = Loadable::Error("Engine not connected".into());
-            return;
-        };
-        self.snapshot = Loadable::Loading;
-        let params = self.params(serde_json::json!({ "forceUsage": force_usage }));
-        self.load_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::LIST_AGENT_ACCOUNTS, params)
-                .await;
-            this.update(cx, |page, cx| {
-                page.snapshot = match result {
-                    Ok(value) => match serde_json::from_value::<AgentAccountsSnapshot>(value) {
-                        Ok(snapshot) => Loadable::Ready(snapshot),
-                        Err(err) => Loadable::Error(err.to_string()),
-                    },
-                    Err(err) => Loadable::Error(err.to_string()),
-                };
-                cx.notify();
-            })
-            .ok();
-        }));
+        let target = self.target_device.clone();
+        self.state.update(cx, |state, cx| {
+            state.load_agent_accounts(target, force_usage, cx)
+        });
         cx.notify();
+    }
+
+    fn snapshot<'a>(&self, cx: &'a Context<Self>) -> &'a Loadable<AgentAccountsSnapshot> {
+        &self.state.read(cx).agent_accounts
     }
 
     /// Switch / Forget an account.
@@ -1204,12 +1187,11 @@ impl Render for AccountsPage {
         let theme = Theme::of(cx).clone();
         let now = Utc::now();
         let dialog = self.render_login_dialog(window.viewport_size(), cx);
-        let refreshing = matches!(self.snapshot, Loadable::Loading);
-        let account_count = self
-            .snapshot
-            .ready()
-            .map(|s| s.accounts.len())
-            .filter(|&n| n > 0);
+        // Owned for the frame: the rows below need `&mut Context` for their
+        // listeners, which rules out holding a borrow of the shared state.
+        let snapshot = self.snapshot(cx).clone();
+        let refreshing = matches!(snapshot, Loadable::Loading);
+        let account_count = snapshot.ready().map(|s| s.accounts.len()).filter(|&n| n > 0);
 
         let provider_icon = |harness: HarnessId| match harness {
             HarnessId::Codex => (crate::icons::OPENAI_MARK, None),
@@ -1242,7 +1224,7 @@ impl Render for AccountsPage {
 
         // One section per provider (zeron settings.agents.tsx `ProviderSection`):
         // brand header + Add account, then the account rows card.
-        let sections: Vec<AnyElement> = match &self.snapshot {
+        let sections: Vec<AnyElement> = match &snapshot {
             Loadable::Idle | Loadable::Loading => PROVIDERS
                 .into_iter()
                 .map(|(harness, name, _cli)| {
