@@ -70,9 +70,24 @@ actions!(
         OpenSettings,
         NextSession,
         PrevSession,
-        ArchiveSession
+        ArchiveSession,
+        ChatEscape,
+        RewindPrev,
+        RewindNext,
+        RewindAccept
     ]
 );
+
+/// How long the second Escape has to arrive. Long enough to be comfortable on
+/// a laptop keyboard, short enough that two deliberate, unrelated Escapes do
+/// not open the list by surprise.
+const REWIND_DOUBLE_TAP: Duration = Duration::from_millis(500);
+
+/// Open rewind list.
+struct RewindState {
+    /// Index into the newest-first prompt list.
+    selected: usize,
+}
 
 #[derive(Clone, Copy)]
 enum ChatMenuPage {
@@ -258,6 +273,17 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
     // key equivalents and must survive keymap re-application.
     crate::app_menus::bind_keys(cx);
     cx.bind_keys([
+        // Not rebindable, and scoped to the chat route: Escape reaches here
+        // only when nothing nearer wants it (the composer propagates when it
+        // has no mention popup to close; the terminal keeps its own context).
+        // The handler tells "first tap" from "open the list" by elapsed time
+        // rather than binding an "escape escape" sequence — a sequence would
+        // swallow the first tap until its timeout expired.
+        KeyBinding::new("escape", ChatEscape, Some("Chat")),
+        KeyBinding::new("up", RewindPrev, Some("Rewind")),
+        KeyBinding::new("down", RewindNext, Some("Rewind")),
+        KeyBinding::new("enter", RewindAccept, Some("Rewind")),
+        KeyBinding::new("escape", ChatEscape, Some("Rewind")),
         KeyBinding::new(
             &valid_or_default(&keymap.toggle_sidebar, "mod-s"),
             ToggleSidebar,
@@ -1074,6 +1100,14 @@ pub struct Shell {
     /// it (a row's FIRST appearance never chimes, so boot stays silent).
     sound_prev: std::collections::HashMap<String, zeron_proto::SessionStatus>,
     user_menu: popover::Popup<()>,
+    /// Open rewind list, if any (double-Escape). `None` is closed.
+    rewind: Option<RewindState>,
+    /// Carries the "Rewind" key context so the list owns ↑/↓/enter while open.
+    rewind_focus: gpui::FocusHandle,
+    /// Focus to hand back when the list closes — normally the composer.
+    rewind_return_focus: Option<gpui::FocusHandle>,
+    /// When Escape was last seen in the chat route, for the double-tap test.
+    last_chat_escape: Option<std::time::Instant>,
     /// Sidebar usage pill, under the user menu.
     account_usage: Entity<crate::account_usage::AccountUsagePill>,
     /// Heartbeat that re-renders once per usage TTL so the pill's staleness
@@ -1357,6 +1391,10 @@ impl Shell {
             space_boot_applied: false,
             sound_prev: std::collections::HashMap::new(),
             user_menu: popover::Popup::default(),
+            rewind: None,
+            rewind_focus: cx.focus_handle(),
+            rewind_return_focus: None,
+            last_chat_escape: None,
             account_usage,
             account_usage_poll: None,
             sidebar_notice: None,
@@ -4503,6 +4541,210 @@ impl Shell {
         }
     }
 
+    /// The rewind list, sitting directly above the composer so the prompt you
+    /// pick appears where it will land.
+    fn render_rewind_list(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let selected = self.rewind.as_ref()?.selected;
+        let theme = Theme::of(cx).clone();
+        let prompts = self.rewind_prompts(cx);
+        if prompts.is_empty() {
+            return None;
+        }
+        let now = Utc::now();
+
+        let rows: Vec<AnyElement> = prompts
+            .iter()
+            .enumerate()
+            .map(|(ix, prompt)| {
+                let active = ix == selected;
+                let age = chrono::DateTime::from_timestamp_millis(prompt.created_at)
+                    .map(|at| crate::state::format_time_ago(at, now))
+                    .unwrap_or_default();
+                let restore = prompt.clone();
+                div()
+                    .id(("rewind-row", ix))
+                    .px(px(10.0))
+                    .py(px(7.0))
+                    .rounded(px(6.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(10.0))
+                    .cursor_pointer()
+                    .when(active, |el| el.bg(theme.glass_hover()))
+                    .when(!active, |el| {
+                        el.hover(|s| s.bg(theme.glass_hover().opacity(0.6)))
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.restore_prompt(restore.clone(), window, cx);
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(crate::typography::ui_rems(12.5))
+                            .text_color(if active { theme.text } else { theme.text_muted })
+                            .child(SharedString::from(crate::rewind::preview(&prompt.text, 120))),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(crate::typography::ui_rems(11.0))
+                            .text_color(theme.text_faint)
+                            .child(SharedString::from(age)),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+
+        let header = div()
+            .px(px(10.0))
+            .pt(px(8.0))
+            .pb(px(6.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .text_size(crate::typography::ui_rems(11.0))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from("Jump to a previous message")),
+            )
+            .child(
+                div()
+                    .text_size(crate::typography::ui_rems(10.5))
+                    .text_color(theme.text_faint)
+                    .child(SharedString::from("\u{2191}\u{2193} move \u{b7} enter restore \u{b7} esc close")),
+            );
+
+        Some(
+            div()
+                .key_context("Rewind")
+                .track_focus(&self.rewind_focus)
+                .on_action(cx.listener(Self::on_rewind_prev))
+                .on_action(cx.listener(Self::on_rewind_next))
+                .on_action(cx.listener(Self::on_rewind_accept))
+                .on_action(cx.listener(Self::on_chat_escape))
+                .mx(px(Theme::SPACE_SM))
+                .mb(px(6.0))
+                .child(
+                    popover::popover_card(&theme)
+                        .w_full()
+                        .flex()
+                        .flex_col()
+                        .child(header)
+                        .child(
+                            // Capped: a long chat scrolls here rather than
+                            // pushing the composer off the bottom.
+                            div()
+                                .id("rewind-list")
+                                .max_h(px(240.0))
+                                .overflow_y_scroll()
+                                .px(px(2.0))
+                                .pb(px(4.0))
+                                .flex()
+                                .flex_col()
+                                .gap(px(1.0))
+                                .children(rows),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Prompts the rewind list offers, newest first.
+    fn rewind_prompts(&self, cx: &Context<Self>) -> Vec<crate::rewind::RewindPrompt> {
+        crate::rewind::rewind_prompts(&self.state.read(cx).transcript)
+    }
+
+    /// Escape in the chat route. The first tap only arms the pair — it must
+    /// stay instant and side-effect-free.
+    fn on_chat_escape(&mut self, _: &ChatEscape, window: &mut Window, cx: &mut Context<Self>) {
+        if self.rewind.is_some() {
+            self.close_rewind(window, cx);
+            return;
+        }
+        let now = std::time::Instant::now();
+        let paired = self
+            .last_chat_escape
+            .is_some_and(|at| now.duration_since(at) <= REWIND_DOUBLE_TAP);
+        // Consume the pair either way: a third tap starts a fresh one rather
+        // than re-opening off the second tap's timestamp.
+        self.last_chat_escape = if paired { None } else { Some(now) };
+        if !paired || self.rewind_prompts(cx).is_empty() {
+            return;
+        }
+        self.rewind_return_focus = window.focused(cx);
+        self.rewind = Some(RewindState { selected: 0 });
+        window.focus(&self.rewind_focus, cx);
+        cx.notify();
+    }
+
+    fn close_rewind(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.rewind.take().is_none() {
+            return;
+        }
+        self.last_chat_escape = None;
+        if let Some(handle) = self.rewind_return_focus.take() {
+            window.focus(&handle, cx);
+        }
+        cx.notify();
+    }
+
+    /// Move the highlight. Clamps rather than wraps: the ends of a short list
+    /// should feel like ends, not teleport you across it.
+    fn move_rewind(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let count = self.rewind_prompts(cx).len();
+        let Some(state) = self.rewind.as_mut() else {
+            return;
+        };
+        if count == 0 {
+            return;
+        }
+        state.selected = state.selected.saturating_add_signed(delta).min(count - 1);
+        cx.notify();
+    }
+
+    fn on_rewind_prev(&mut self, _: &RewindPrev, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_rewind(-1, cx);
+    }
+
+    fn on_rewind_next(&mut self, _: &RewindNext, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_rewind(1, cx);
+    }
+
+    fn on_rewind_accept(&mut self, _: &RewindAccept, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(selected) = self.rewind.as_ref().map(|s| s.selected) else {
+            return;
+        };
+        let Some(prompt) = self.rewind_prompts(cx).into_iter().nth(selected) else {
+            return;
+        };
+        self.restore_prompt(prompt, window, cx);
+    }
+
+    /// Put a previous prompt back in the composer, ready to edit and resend.
+    ///
+    /// Deliberately does not touch the transcript — see the `crate::rewind`
+    /// module docs for why truncating our mirror would lie about what the
+    /// agent still remembers.
+    fn restore_prompt(
+        &mut self,
+        prompt: crate::rewind::RewindPrompt,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Close first: it hands focus back, which must happen before the
+        // caret lands at the end of the restored text.
+        self.close_rewind(window, cx);
+        self.composer
+            .update(cx, |composer, cx| composer.set_prompt(&prompt.text, cx));
+        window.focus(&self.composer.focus_handle(cx), cx);
+        cx.notify();
+    }
+
     /// Update strip: shown above the user menu whenever the engine's
     /// UpdateStatus stream reports a newer release. On a macOS bundle install
     /// it drives the whole flow — click to download, then click to restart into
@@ -5658,6 +5900,11 @@ impl Shell {
         // never be able to resurrect stale external-file hover state.
         div()
             .id("chat-dropzone")
+            // Escape reaches here only after the composer declines it (no
+            // mention popup open) and the terminal's own context has not
+            // claimed it — see `ComposerInput::mention_escape`.
+            .key_context("Chat")
+            .on_action(cx.listener(Self::on_chat_escape))
             .relative()
             .flex_1()
             .min_w_0()
@@ -5734,6 +5981,7 @@ impl Shell {
                         .absolute()
                         .inset_0(),
                     )
+                    .children(self.render_rewind_list(cx))
                     .child(status)
                     .when(has_spaces, |el| el.child(self.composer.clone()))
                     .child(self.render_terminal_container(cx))
