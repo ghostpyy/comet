@@ -186,6 +186,17 @@ impl DevicesPage {
             .into_any_element();
         Some(popover::modal("rename-device-dialog", viewport, card))
     }
+
+    /// Dismiss the topmost dialog, if any. Escape asks the page before it
+    /// leaves the route, so a dialog swallows it rather than the whole of
+    /// Settings closing underneath the thing you were cancelling.
+    pub fn dismiss_dialog(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.rename.take().is_some() {
+            cx.notify();
+            return true;
+        }
+        false
+    }
 }
 
 /// Human platform label (zeron settings.devices.tsx `platformLabel`).

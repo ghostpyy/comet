@@ -1108,6 +1108,21 @@ impl AccountsPage {
         Some(popover::modal("add-account-dialog", viewport, card))
     }
 
+    /// Dismiss the topmost dialog, if any. Escape asks the page before it
+    /// leaves the route, so a dialog swallows it rather than the whole of
+    /// Settings closing underneath the thing you were cancelling.
+    pub fn dismiss_dialog(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.login.take().is_some() {
+            // Drop the browser poll with the dialog: nothing is listening for
+            // its answer once the flow is gone.
+            self.poll_task = None;
+            self.error = None;
+            cx.notify();
+            return true;
+        }
+        false
+    }
+
     /// A ghost account row (zeron settings.agents.tsx `SkeletonRow`): avatar,
     /// email line, two usage-meter ghosts, a badge — same geometry as the real
     /// row so loaded data lands without a layout jump. `dim` fades row two.

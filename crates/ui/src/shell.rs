@@ -1080,6 +1080,9 @@ pub struct Shell {
     delete_confirm: Option<String>,
     /// Space-row context menu (dropdown rows): (space id, window position).
     space_menu: popover::Popup<(String, Point<Pixels>)>,
+    /// In-flight native image picker for a project icon or the profile photo.
+    space_icon_task: Option<Task<()>>,
+    profile_photo_task: Option<Task<()>>,
     rename_space_dialog: Option<RenameSpaceDialog>,
     /// Space id awaiting delete confirmation (hard delete + session cascade).
     delete_space_confirm: Option<String>,
@@ -1386,6 +1389,8 @@ impl Shell {
             rename_dialog: None,
             delete_confirm: None,
             space_menu: popover::Popup::default(),
+            space_icon_task: None,
+            profile_photo_task: None,
             rename_space_dialog: None,
             delete_space_confirm: None,
             add_space: None,
@@ -2417,13 +2422,76 @@ impl Shell {
         cx.notify();
     }
 
-    fn on_close_settings(&mut self, _: &CloseSettings, _: &mut Window, cx: &mut Context<Self>) {
-        self.close_settings(cx);
+    fn on_close_settings(&mut self, _: &CloseSettings, window: &mut Window, cx: &mut Context<Self>) {
+        // Innermost first: a dialog open on the page eats this Escape, so
+        // cancelling a rename does not also throw you out of Settings.
+        if self.dismiss_settings_dialog(cx) {
+            return;
+        }
+        self.close_settings(window, cx);
     }
 
-    fn close_settings(&mut self, cx: &mut Context<Self>) {
+    /// Ask the visible settings page to close its own dialog. Returns whether
+    /// one was open — only the routed page is asked, so a stale dialog on a
+    /// page you navigated away from cannot swallow the key.
+    fn dismiss_settings_dialog(&mut self, cx: &mut Context<Self>) -> bool {
+        let Route::Settings(section) = self.route else {
+            return false;
+        };
+        match section {
+            SettingsSection::Devices => self
+                .devices_page
+                .as_ref()
+                .is_some_and(|p| p.update(cx, |page, cx| page.dismiss_dialog(cx))),
+            SettingsSection::Agents => self
+                .accounts_page
+                .as_ref()
+                .is_some_and(|p| p.update(cx, |page, cx| page.dismiss_dialog(cx))),
+            SettingsSection::Appearance => self
+                .appearance_page
+                .as_ref()
+                .is_some_and(|p| p.update(cx, |page, cx| page.dismiss_dialog(cx))),
+            // The remaining pages own no dialogs.
+            _ => false,
+        }
+    }
+
+    /// Pick a profile photo. Device-local, like the project icons: the path
+    /// resolves only on this machine, so it never reaches the doc.
+    fn pick_profile_photo(&mut self, cx: &mut Context<Self>) {
+        self.close_user_menu(cx);
+        let rx = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Use image".into()),
+        });
+        self.profile_photo_task = Some(cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = rx.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            this.update(cx, |_, cx| {
+                crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| {
+                    settings.profile_photo = Some(path.to_string_lossy().into_owned());
+                });
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.route = Route::Chat;
         self.nav.push(NavEntry::Chat(self.active_chat.clone()));
+        // Hand focus back. The settings outlet's handle stops being rendered
+        // the moment the route flips, and a focus handle with no element is
+        // not in the dispatch tree — leaving it focused silently drops every
+        // root-level shortcut (ctrl-tab and friends) until something else
+        // takes focus.
+        window.focus(&self.composer.focus_handle(cx), cx);
         cx.notify();
     }
 
@@ -3869,7 +3937,7 @@ impl Shell {
                         .text_color(theme.text_muted)
                         .cursor_pointer()
                         .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
-                        .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx)))
+                        .on_click(cx.listener(|this, _, window, cx| this.close_settings(window, cx)))
                         .child(
                             // AltArrowLeft chevron (zeron settings-sidebar.tsx),
                             // not the straight history arrow.
@@ -4955,9 +5023,17 @@ impl Shell {
                 }
                 cx.notify();
             }))
-            .child(
+            .child(match crate::settings::profile_photo(cx) {
+                // Cover-cropped into the same 28px circle the initial used, so
+                // swapping one for the other never moves the row.
+                Some(path) => gpui::img(path)
+                    .size(px(28.0))
+                    .flex_none()
+                    .rounded_full()
+                    .object_fit(gpui::ObjectFit::Cover)
+                    .into_any_element(),
                 // Avatar: white circle, initial in near-black (zeron user-menu.tsx).
-                div()
+                None => div()
                     .size(px(28.0))
                     .flex_none()
                     .rounded_full()
@@ -4968,8 +5044,9 @@ impl Shell {
                     .text_size(crate::typography::ui_rems(12.0))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(theme.bg)
-                    .child(initial),
-            )
+                    .child(initial)
+                    .into_any_element(),
+            })
             .child(
                 // Identity stays the left column; the plan meter rides the
                 // right so the row reads "who, then how much left".
@@ -5075,6 +5152,39 @@ impl Shell {
                     };
                     menu.child(row).child(popover::menu_separator())
                 })
+                .child(
+                    popover::menu_row(theme, false, "user-menu-photo")
+                        .id("user-menu-photo")
+                        .on_click(cx.listener(|this, _, _, cx| this.pick_profile_photo(cx)))
+                        .child(
+                            icon(icons::PAPERCLIP)
+                                .size(px(16.0))
+                                .text_color(theme.text_muted),
+                        )
+                        .child(SharedString::from("Change photo…")),
+                )
+                .when(crate::settings::profile_photo(cx).is_some(), |menu| {
+                    menu.child(
+                        popover::menu_row(theme, false, "user-menu-photo-clear")
+                            .id("user-menu-photo-clear")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.close_user_menu(cx);
+                                crate::settings::update(
+                                    crate::settings::SavePolicy::Immediate,
+                                    cx,
+                                    |settings| settings.profile_photo = None,
+                                );
+                                cx.notify();
+                            }))
+                            .child(
+                                icon(icons::RESTART)
+                                    .size(px(16.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(SharedString::from("Remove photo")),
+                    )
+                })
+                .child(popover::menu_separator())
                 .child(
                     popover::menu_row(theme, false, "user-menu-settings")
                         .id("user-menu-settings")

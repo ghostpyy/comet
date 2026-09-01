@@ -771,12 +771,17 @@ impl Shell {
                     this.open_spaces_menu(window, cx);
                 }
             }))
-            .child(
-                icon(icons::FOLDER)
-                    .size(px(16.0))
-                    .flex_none()
-                    .text_color(theme.text_muted),
-            )
+            .children(match filter.as_deref() {
+                Some(id) => Some(Self::space_glyph(id, 16.0, theme, cx)),
+                // "All projects" is not one project, so it keeps the glyph.
+                None => Some(
+                    icon(icons::FOLDER)
+                        .size(px(16.0))
+                        .flex_none()
+                        .text_color(theme.text_muted)
+                        .into_any_element(),
+                ),
+            })
             // flex_1 pushes the caret to the trigger's right edge and gives
             // long space names a bound to truncate against; the "@ device"
             // tag hugs the name inside it rather than sitting by the caret.
@@ -978,6 +983,12 @@ impl Shell {
                             SpacesMenuRow::AddSpace => icons::PLUS,
                             _ => icons::FOLDER,
                         };
+                        // A project with a custom image shows it here too, so
+                        // the menu and the trigger agree.
+                        let leading_image = match &row {
+                            SpacesMenuRow::Space(id) => crate::settings::space_icon(id, cx),
+                            _ => None,
+                        };
                         let menu_space = match &row {
                             SpacesMenuRow::Space(id) => Some(id.clone()),
                             _ => None,
@@ -1002,12 +1013,19 @@ impl Shell {
                                 }),
                             )
                         })
-                        .child(
-                            icon(leading)
+                        .child(match leading_image {
+                            Some(path) => gpui::img(path)
                                 .size(px(15.0))
                                 .flex_none()
-                                .text_color(theme.text_muted.opacity(0.8)),
-                        )
+                                .rounded(px(4.0))
+                                .object_fit(gpui::ObjectFit::Cover)
+                                .into_any_element(),
+                            None => icon(leading)
+                                .size(px(15.0))
+                                .flex_none()
+                                .text_color(theme.text_muted.opacity(0.8))
+                                .into_any_element(),
+                        })
                         .child(div().flex_1().min_w_0().truncate().child(label))
                         .when_some(tag, |el, tag| {
                             el.child(
@@ -2831,6 +2849,64 @@ impl Shell {
         }
     }
 
+    /// Pick an image to stand in for a project's folder glyph. Device-local:
+    /// the path only resolves on this machine, so it is never written to the
+    /// doc (see `settings::UiSettings::space_icons`).
+    /// A project's leading glyph: its custom image when one is set and still
+    /// on disk, else the folder icon. Square-cropped and rounded so portrait
+    /// and landscape sources both sit in the row without distorting.
+    fn space_glyph(space_id: &str, size: f32, theme: &Theme, cx: &App) -> AnyElement {
+        match crate::settings::space_icon(space_id, cx) {
+            Some(path) => gpui::img(path)
+                .size(px(size))
+                .flex_none()
+                .rounded(px(size * 0.25))
+                .object_fit(gpui::ObjectFit::Cover)
+                .into_any_element(),
+            None => icon(icons::FOLDER)
+                .size(px(size))
+                .flex_none()
+                .text_color(theme.text_muted)
+                .into_any_element(),
+        }
+    }
+
+    pub(super) fn pick_space_icon(&mut self, space_id: String, cx: &mut Context<Self>) {
+        self.close_space_menu(cx);
+        let rx = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Use image".into()),
+        });
+        self.space_icon_task = Some(cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = rx.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            this.update(cx, |_, cx| {
+                crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| {
+                    settings
+                        .space_icons
+                        .insert(space_id.clone(), path.to_string_lossy().into_owned());
+                });
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Drop a project's custom icon; the folder glyph comes back.
+    pub(super) fn clear_space_icon(&mut self, space_id: String, cx: &mut Context<Self>) {
+        self.close_space_menu(cx);
+        crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| {
+            settings.space_icons.remove(&space_id);
+        });
+        cx.notify();
+    }
+
     pub(super) fn open_rename_space(&mut self, space_id: String, cx: &mut Context<Self>) {
         self.close_space_menu(cx);
         let current = self
@@ -2893,6 +2969,9 @@ impl Shell {
             let closing = self.space_menu.closing_since();
             let rename_id = space_id.clone();
             let delete_id = space_id.clone();
+            let icon_id = space_id.clone();
+            let clear_id = space_id.clone();
+            let has_icon = crate::settings::space_icon(&space_id, cx).is_some();
             let menu = popover::popover_card(&theme)
                 .w(px(170.0))
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
@@ -2909,6 +2988,30 @@ impl Shell {
                         .child(icon(icons::PEN).size(px(16.0)).text_color(theme.text_muted))
                         .child(SharedString::from("Rename…")),
                 )
+                .child(
+                    popover::menu_row(&theme, false, format!("space-menu-icon-{space_id}"))
+                        .id("space-menu-icon")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.pick_space_icon(icon_id.clone(), cx)
+                        }))
+                        .child(icon(icons::PAPERCLIP).size(px(16.0)).text_color(theme.text_muted))
+                        .child(SharedString::from("Change icon…")),
+                )
+                .when(has_icon, |menu| {
+                    menu.child(
+                        popover::menu_row(&theme, false, format!("space-menu-icon-clear-{space_id}"))
+                            .id("space-menu-icon-clear")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.clear_space_icon(clear_id.clone(), cx)
+                            }))
+                            .child(
+                                icon(icons::RESTART)
+                                    .size(px(16.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(SharedString::from("Use folder icon")),
+                    )
+                })
                 .child(popover::menu_separator())
                 .child(
                     popover::menu_row(&theme, false, format!("space-menu-delete-{space_id}"))

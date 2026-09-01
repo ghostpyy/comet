@@ -1629,6 +1629,17 @@ impl AppearancePage {
         Some(popover::modal("theme-import-dialog", viewport, card))
     }
 
+    /// Dismiss the topmost dialog, if any. Escape asks the page before it
+    /// leaves the route, so a dialog swallows it rather than the whole of
+    /// Settings closing underneath the thing you were cancelling.
+    pub fn dismiss_dialog(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.import_dialog.take().is_some() {
+            cx.notify();
+            return true;
+        }
+        false
+    }
+
     fn render_review_dialog(
         &mut self,
         viewport: gpui::Size<gpui::Pixels>,

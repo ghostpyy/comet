@@ -101,6 +101,23 @@ pub fn current(cx: &App) -> UiSettings {
         .unwrap_or_default()
 }
 
+/// Custom icon for a space, if one is set and still on disk.
+///
+/// Checked rather than trusted: the file is a path the user picked once and
+/// may since have moved or deleted, and `img()` on a missing path paints
+/// nothing at all — a silently blank icon is worse than the folder glyph.
+pub fn space_icon(space_id: &str, cx: &App) -> Option<std::path::PathBuf> {
+    let path = std::path::PathBuf::from(current(cx).space_icons.get(space_id)?);
+    path.is_file().then_some(path)
+}
+
+/// The profile photo, if one is set and still on disk. See [`space_icon`] for
+/// why existence is checked here rather than assumed.
+pub fn profile_photo(cx: &App) -> Option<std::path::PathBuf> {
+    let path = std::path::PathBuf::from(current(cx).profile_photo.as_ref()?);
+    path.is_file().then_some(path)
+}
+
 pub fn update(policy: SavePolicy, cx: &mut App, mutate: impl FnOnce(&mut UiSettings)) -> bool {
     let Some(store) = cx.try_global::<SettingsStore>() else {
         return false;
@@ -207,6 +224,17 @@ pub struct UiSettings {
     /// also the new-tab default when the sidebar filter is "All".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_space_id: Option<String>,
+    /// Custom project icons: space id → image path on this device.
+    ///
+    /// Device-local on purpose. The image lives at a path only this machine
+    /// can resolve, so syncing the entry would show every other device a
+    /// broken icon. Entries for deleted spaces are pruned on write.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub space_icons: std::collections::HashMap<String, String>,
+    /// Profile photo path, replacing the initial in the sidebar avatar.
+    /// Device-local for the same reason as [`Self::space_icons`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_photo: Option<String>,
     /// Open session tabs in visual order (drag-reorder edits in place).
     /// Device-local: a tab is a local viewport onto the synced session list —
     /// closing one never archives the session. Ids of archived/deleted chats
@@ -277,6 +305,8 @@ impl Default for UiSettings {
             sidebar_show_branch: true,
             sidebar_show_pull_request: true,
             last_space_id: None,
+            space_icons: std::collections::HashMap::new(),
+            profile_photo: None,
             open_tabs: None,
             space_filter: None,
             tab_order: std::collections::HashMap::new(),
@@ -764,6 +794,11 @@ mod tests {
     fn round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let settings = UiSettings {
+            space_icons: std::collections::HashMap::from([(
+                "space-1".to_string(),
+                "/tmp/icon.png".to_string(),
+            )]),
+            profile_photo: Some("/tmp/me.png".to_string()),
             sidebar_width: 300.0,
             sidebar_collapsed: true,
             sidebar_grouped: true,

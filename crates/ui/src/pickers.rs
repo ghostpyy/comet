@@ -2474,7 +2474,26 @@ impl Pickers {
                     SharedString::from(label),
                     &theme,
                 ))
-                .children(self.render_account_chip(&theme, cx));
+                // Sessions get the account chip here, with its own card
+                // mounted on it — this branch returns before the draft
+                // overlay plumbing below ever runs.
+                .children(self.render_account_chip(&theme, cx).map(|chip| {
+                    let mut overlay = (self.mounted_kind() == Some(PickerKind::Account))
+                        .then(|| {
+                            let content = self.render_account_popover(cx);
+                            (
+                                PickerKind::Account,
+                                self.popover_frame(296.0, content, cx),
+                            )
+                        });
+                    attach_overlay(
+                        chip,
+                        &mut overlay,
+                        PickerKind::Account,
+                        "account-popover",
+                        self.open.closing_since(),
+                    )
+                }));
             let right = div()
                 .flex()
                 .flex_row()
@@ -2594,7 +2613,11 @@ impl Pickers {
     /// The colour keys off the window being *shown*, so the number and its
     /// tint always tell one story — a calm "91% left" reads calm. A tighter
     /// window elsewhere on the plan is one click away in the card.
-    fn render_account_chip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_account_chip(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Stateful<gpui::Div>> {
         use crate::account_usage as usage;
         let account = self.usage_account(cx)?;
         let headline = usage::headline_window(&account.usage_windows)?;
@@ -2624,8 +2647,7 @@ impl Pickers {
                         .text_size(crate::typography::ui_rems(11.0))
                         .text_color(tint)
                         .child(usage::remaining_label(headline.used_fraction)),
-                )
-                .into_any_element(),
+                ),
         )
     }
 
