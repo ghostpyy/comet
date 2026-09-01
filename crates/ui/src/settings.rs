@@ -235,6 +235,12 @@ pub struct UiSettings {
     /// Device-local for the same reason as [`Self::space_icons`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_photo: Option<String>,
+    /// The settings section last visited. Reopening lands you back where you
+    /// were rather than always on Devices — settings is somewhere you return
+    /// to mid-task, and the section you were in is nearly always the one you
+    /// want next.
+    #[serde(default)]
+    pub settings_section: crate::shell::SettingsSection,
     /// Open session tabs in visual order (drag-reorder edits in place).
     /// Device-local: a tab is a local viewport onto the synced session list —
     /// closing one never archives the session. Ids of archived/deleted chats
@@ -307,6 +313,7 @@ impl Default for UiSettings {
             last_space_id: None,
             space_icons: std::collections::HashMap::new(),
             profile_photo: None,
+            settings_section: crate::shell::SettingsSection::default(),
             open_tabs: None,
             space_filter: None,
             tab_order: std::collections::HashMap::new(),
@@ -799,6 +806,7 @@ mod tests {
                 "/tmp/icon.png".to_string(),
             )]),
             profile_photo: Some("/tmp/me.png".to_string()),
+            settings_section: crate::shell::SettingsSection::Appearance,
             sidebar_width: 300.0,
             sidebar_collapsed: true,
             sidebar_grouped: true,
@@ -839,6 +847,8 @@ mod tests {
             legacy_accent_color: None,
         };
         settings.save(dir.path()).unwrap();
+        // Whole-struct equality, so a newly added field that fails to
+        // round-trip (dropping a user's icons) fails here.
         assert_eq!(UiSettings::load(dir.path()), settings);
     }
 

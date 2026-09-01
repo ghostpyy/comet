@@ -351,7 +351,8 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
 }
 
 /// The settings sections (feature-inventory §1.5 routes).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum SettingsSection {
     Devices,
     /// Which harnesses the composer offers (enable/disable toggles).
@@ -362,6 +363,12 @@ pub enum SettingsSection {
     Notifications,
     Shortcuts,
     Archived,
+}
+
+impl Default for SettingsSection {
+    fn default() -> Self {
+        SettingsSection::Devices
+    }
 }
 
 impl SettingsSection {
@@ -1122,6 +1129,11 @@ pub struct Shell {
     rewind_return_focus: Option<gpui::FocusHandle>,
     /// When Escape was last seen in the chat route, for the double-tap test.
     last_chat_escape: Option<std::time::Instant>,
+    /// The rewind list needs focus on the next frame. Its element does not
+    /// exist until the render that follows opening, and focusing a handle
+    /// that is not yet in the dispatch tree is dropped — which would leave
+    /// the arrow keys dead in an open list.
+    rewind_focus_pending: bool,
     /// Sidebar usage pill, under the user menu.
     /// Heartbeat that re-renders once per usage TTL so the pill's staleness
     /// check runs while nothing else is changing. Dropped whenever the pill
@@ -1275,6 +1287,7 @@ impl Shell {
                     // No Window in a subscription — focus on the next frame,
                     // or Escape lands nowhere on the page we just opened.
                     this.settings_focus_pending = true;
+                    this.remember_settings_section(SettingsSection::Agents, cx);
                     cx.notify();
                 }
             },
@@ -1416,6 +1429,7 @@ impl Shell {
             rewind_focus: cx.focus_handle(),
             rewind_return_focus: None,
             last_chat_escape: None,
+            rewind_focus_pending: false,
             account_usage_poll: None,
             sidebar_notice: None,
             update_flow: UpdateFlow::Idle,
@@ -2429,6 +2443,7 @@ impl Shell {
         // take focus from here on their own.
         window.focus(&self.settings_focus, cx);
         self.settings_focus_pending = false;
+        self.remember_settings_section(section, cx);
         cx.notify();
     }
 
@@ -2493,6 +2508,22 @@ impl Shell {
             })
             .ok();
         }));
+    }
+
+    /// Remember where settings was left, so the next open returns there.
+    /// Goes through `schedule_save` — the only writer — so it is not undone
+    /// by the next whole-struct save.
+    fn remember_settings_section(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
+        if self.settings.settings_section == section {
+            return;
+        }
+        self.settings.settings_section = section;
+        self.schedule_save(cx);
+    }
+
+    /// The section the next settings open lands on.
+    fn last_settings_section(&self) -> SettingsSection {
+        self.settings.settings_section
     }
 
     fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4775,7 +4806,7 @@ impl Shell {
         }
         self.rewind_return_focus = window.focused(cx);
         self.rewind = Some(RewindState { selected: 0 });
-        window.focus(&self.rewind_focus, cx);
+        self.rewind_focus_pending = true;
         cx.notify();
     }
 
@@ -5198,7 +5229,8 @@ impl Shell {
                     popover::menu_row(theme, false, "user-menu-settings")
                         .id("user-menu-settings")
                         .on_click(cx.listener(|this, _, window, cx| {
-                            this.open_settings(SettingsSection::Devices, window, cx)
+                            let section = this.last_settings_section();
+                            this.open_settings(section, window, cx)
                         }))
                         .child(
                             icon(icons::SETTINGS_MINIMALISTIC)
@@ -7765,6 +7797,9 @@ impl Render for Shell {
         {
             window.focus(&self.settings_focus, cx);
         }
+        if std::mem::take(&mut self.rewind_focus_pending) && self.rewind.is_some() {
+            window.focus(&self.rewind_focus, cx);
+        }
         // Appearance actions persist independently of the shell. Mirror the
         // globals before any later debounced settings save can overwrite them.
         self.settings.appearance = crate::appearance::mode(cx);
@@ -7883,7 +7918,8 @@ impl Render for Shell {
             // Native Settings menu item and the platform convention (Cmd+, on
             // macOS, Ctrl+, elsewhere) always land on the default section.
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
-                this.open_settings(SettingsSection::Devices, window, cx)
+                let section = this.last_settings_section();
+                this.open_settings(section, window, cx)
             }))
             // Chat-scoped, unlike new-session — `cycle_session` holds the guard
             // and says why.
