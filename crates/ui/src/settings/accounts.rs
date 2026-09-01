@@ -115,11 +115,25 @@ pub fn format_reset(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Opt
 }
 
 /// The provider cards, in display order: (harness, name, CLI command — named
-/// in the empty-state copy, zeron settings.agents.tsx `PROVIDERS`).
+/// in the empty-state copy, zeron settings.agents.tsx `PROVIDERS`). The name
+/// comes from [`crate::pickers::harness_label`] so these section headers and
+/// every other place that names a harness cannot drift apart.
 pub const PROVIDERS: [(HarnessId, &str, &str); 3] = [
-    (HarnessId::ClaudeCode, "Claude Code", "claude"),
-    (HarnessId::Codex, "Codex", "codex"),
-    (HarnessId::Cursor, "Cursor", "cursor-agent"),
+    (
+        HarnessId::ClaudeCode,
+        crate::pickers::harness_label(HarnessId::ClaudeCode),
+        "claude",
+    ),
+    (
+        HarnessId::Codex,
+        crate::pickers::harness_label(HarnessId::Codex),
+        "codex",
+    ),
+    (
+        HarnessId::Cursor,
+        crate::pickers::harness_label(HarnessId::Cursor),
+        "cursor-agent",
+    ),
 ];
 
 /// Accounts of one provider, in the engine's order (slot creation). No
@@ -183,13 +197,11 @@ pub struct AccountsPage {
     /// accounts RPCs are relay-forwardable, CLI logins are per-device).
     target_device: Option<String>,
     device_menu: popover::Popup<()>,
-    snapshot: Loadable<AgentAccountsSnapshot>,
     /// Account id with an in-flight Switch/Forget.
     busy_account: Option<String>,
     login: Option<LoginFlow>,
     error: Option<SharedString>,
     code_input: Entity<ComposerInput>,
-    load_task: Option<Task<()>>,
     action_task: Option<Task<()>>,
     poll_task: Option<Task<()>>,
     _observe: Subscription,
@@ -209,12 +221,10 @@ impl AccountsPage {
             state,
             target_device: None,
             device_menu: popover::Popup::default(),
-            snapshot: Loadable::Idle,
             busy_account: None,
             login: None,
             error: None,
             code_input,
-            load_task: None,
             action_task: None,
             poll_task: None,
             _observe: observe,
@@ -427,31 +437,18 @@ impl AccountsPage {
         trigger.into_any_element()
     }
 
+    /// Delegate to the shared snapshot on [`AppState`], so this page and any
+    /// other reader of the same accounts cost one provider probe between them.
     fn load(&mut self, force_usage: bool, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.snapshot = Loadable::Error("Engine not connected".into());
-            return;
-        };
-        self.snapshot = Loadable::Loading;
-        let params = self.params(serde_json::json!({ "forceUsage": force_usage }));
-        self.load_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::LIST_AGENT_ACCOUNTS, params)
-                .await;
-            this.update(cx, |page, cx| {
-                page.snapshot = match result {
-                    Ok(value) => match serde_json::from_value::<AgentAccountsSnapshot>(value) {
-                        Ok(snapshot) => Loadable::Ready(snapshot),
-                        Err(err) => Loadable::Error(err.to_string()),
-                    },
-                    Err(err) => Loadable::Error(err.to_string()),
-                };
-                cx.notify();
-            })
-            .ok();
-        }));
+        let target = self.target_device.clone();
+        self.state.update(cx, |state, cx| {
+            state.load_agent_accounts(target, force_usage, cx)
+        });
         cx.notify();
+    }
+
+    fn snapshot<'a>(&self, cx: &'a Context<Self>) -> &'a Loadable<AgentAccountsSnapshot> {
+        &self.state.read(cx).agent_accounts
     }
 
     /// Switch / Forget an account.
@@ -724,13 +721,14 @@ impl AccountsPage {
                     .rounded_full()
                     .overflow_hidden()
                     .bg(crate::theme::ink(0.07))
-                    .when(fraction > 0.0, |el| {
+                    .when(fraction < 1.0, |el| {
                         el.child(
                             div()
                                 .h_full()
-                                // A 1.5% floor keeps tiny non-zero usage
-                                // visible (zeron `max(used, 1.5)%`).
-                                .w(gpui::relative(fraction.max(0.015)))
+                                // Draws what is LEFT, matching the label; the
+                                // 1.5% floor keeps a nearly-spent window from
+                                // reading as an empty track.
+                                .w(gpui::relative((1.0 - fraction).max(0.015)))
                                 .rounded_full()
                                 .bg(fill),
                         )
@@ -741,10 +739,7 @@ impl AccountsPage {
                     .w(px(64.0))
                     .flex_none()
                     .text_right()
-                    .child(SharedString::from(format!(
-                        "{}% used",
-                        (fraction * 100.0).round() as u32
-                    ))),
+                    .child(crate::account_usage::remaining_label(fraction)),
             )
             .when_some(reset, |el, reset| {
                 el.child(
@@ -1113,6 +1108,21 @@ impl AccountsPage {
         Some(popover::modal("add-account-dialog", viewport, card))
     }
 
+    /// Dismiss the topmost dialog, if any. Escape asks the page before it
+    /// leaves the route, so a dialog swallows it rather than the whole of
+    /// Settings closing underneath the thing you were cancelling.
+    pub fn dismiss_dialog(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.login.take().is_some() {
+            // Drop the browser poll with the dialog: nothing is listening for
+            // its answer once the flow is gone.
+            self.poll_task = None;
+            self.error = None;
+            cx.notify();
+            return true;
+        }
+        false
+    }
+
     /// A ghost account row (zeron settings.agents.tsx `SkeletonRow`): avatar,
     /// email line, two usage-meter ghosts, a badge — same geometry as the real
     /// row so loaded data lands without a layout jump. `dim` fades row two.
@@ -1204,29 +1214,19 @@ impl Render for AccountsPage {
         let theme = Theme::of(cx).clone();
         let now = Utc::now();
         let dialog = self.render_login_dialog(window.viewport_size(), cx);
-        let refreshing = matches!(self.snapshot, Loadable::Loading);
-        let account_count = self
-            .snapshot
+        // Owned for the frame: the rows below need `&mut Context` for their
+        // listeners, which rules out holding a borrow of the shared state.
+        let snapshot = self.snapshot(cx).clone();
+        let refreshing = matches!(snapshot, Loadable::Loading);
+        let account_count = snapshot
             .ready()
             .map(|s| s.accounts.len())
             .filter(|&n| n > 0);
 
-        let provider_icon = |harness: HarnessId| match harness {
-            HarnessId::Codex => (crate::icons::OPENAI_MARK, None),
-            HarnessId::Cursor => (crate::icons::CURSOR_MARK, None),
-            HarnessId::Grok => (crate::icons::GROK_MARK, None),
-            HarnessId::Hermes => (crate::icons::HERMES_MARK, None),
-            HarnessId::Pi => (crate::icons::PI_MARK, None),
-            HarnessId::Opencode => (crate::icons::OPENCODE_MARK, None),
-            _ => (
-                crate::icons::CLAUDE_MARK,
-                Some(crate::icons::claude_brand()),
-            ),
-        };
         // Brand mark inside a 24px centered box (zeron: `grid size-6
         // place-items-center [&_svg]:size-4`).
         let provider_mark = |harness: HarnessId, theme: &Theme| {
-            let (mark, tint) = provider_icon(harness);
+            let (mark, tint) = crate::pickers::harness_brand_icon(harness);
             div()
                 .flex_none()
                 .size(px(24.0))
@@ -1242,7 +1242,7 @@ impl Render for AccountsPage {
 
         // One section per provider (zeron settings.agents.tsx `ProviderSection`):
         // brand header + Add account, then the account rows card.
-        let sections: Vec<AnyElement> = match &self.snapshot {
+        let sections: Vec<AnyElement> = match &snapshot {
             Loadable::Idle | Loadable::Loading => PROVIDERS
                 .into_iter()
                 .map(|(harness, name, _cli)| {

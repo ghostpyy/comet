@@ -12,6 +12,7 @@
 //! - [`shell`] — sidebar + main panel + right-pane scaffold + gate;
 //! - [`loaders`] — zeron pulse loader, gradient spinner, boot splash.
 
+pub mod account_usage;
 pub mod app_menus;
 pub mod appearance;
 pub mod attachments;
@@ -32,6 +33,7 @@ pub mod notify;
 pub mod pickers;
 pub mod popover;
 pub mod rail;
+pub mod rewind;
 pub mod settings;
 pub mod shell;
 pub mod sound;
