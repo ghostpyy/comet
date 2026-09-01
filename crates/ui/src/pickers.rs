@@ -2638,6 +2638,17 @@ impl Pickers {
                 .when(!open, |el| {
                     el.hover(|st| st.bg(theme.glass_hover().opacity(0.7)))
                 })
+                // Same press-guard every other footer chip uses: the card's
+                // `on_mouse_down_out` already began closing on this press, so
+                // without recording it the click reads the popup as closed and
+                // reopens it — the chip would never close on a second click.
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _, _, _| {
+                        this.open
+                            .note_trigger_press_matching(|open| *open == PickerKind::Account)
+                    }),
+                )
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.toggle(PickerKind::Account, window, cx);
                 }))

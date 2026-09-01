@@ -1110,6 +1110,10 @@ pub struct Shell {
     /// Focus target for the settings outlet, carrying the "Settings" key
     /// context that scopes Escape to that route.
     settings_focus: gpui::FocusHandle,
+    /// The settings outlet needs focus on the next frame. Set by every path
+    /// that routes INTO settings — some have no `Window` to focus with, and
+    /// an unfocused outlet leaves Escape with no dispatch path at all.
+    settings_focus_pending: bool,
     /// Open rewind list, if any (double-Escape). `None` is closed.
     rewind: Option<RewindState>,
     /// Carries the "Rewind" key context so the list owns ↑/↓/enter while open.
@@ -1267,6 +1271,10 @@ impl Shell {
             |this: &mut Shell, _, event: &crate::pickers::PickerEvent, cx| match event {
                 crate::pickers::PickerEvent::OpenAccountSettings => {
                     this.route = Route::Settings(SettingsSection::Agents);
+                    this.nav.push(NavEntry::Settings(SettingsSection::Agents));
+                    // No Window in a subscription — focus on the next frame,
+                    // or Escape lands nowhere on the page we just opened.
+                    this.settings_focus_pending = true;
                     cx.notify();
                 }
             },
@@ -1403,6 +1411,7 @@ impl Shell {
             sound_prev: std::collections::HashMap::new(),
             user_menu: popover::Popup::default(),
             settings_focus: cx.focus_handle(),
+            settings_focus_pending: false,
             rewind: None,
             rewind_focus: cx.focus_handle(),
             rewind_return_focus: None,
@@ -2419,6 +2428,7 @@ impl Shell {
         // path and Escape resolves to CloseSettings. Pages owning an input
         // take focus from here on their own.
         window.focus(&self.settings_focus, cx);
+        self.settings_focus_pending = false;
         cx.notify();
     }
 
@@ -2473,10 +2483,12 @@ impl Shell {
             let Some(path) = paths.into_iter().next() else {
                 return;
             };
-            this.update(cx, |_, cx| {
-                crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| {
-                    settings.profile_photo = Some(path.to_string_lossy().into_owned());
-                });
+            this.update(cx, |shell, cx| {
+                // Through the shell's own copy: `schedule_save` writes the
+                // whole struct, so a field-level write beside it is undone by
+                // the next save.
+                shell.settings.profile_photo = Some(path.to_string_lossy().into_owned());
+                shell.schedule_save(cx);
                 cx.notify();
             })
             .ok();
@@ -5169,11 +5181,8 @@ impl Shell {
                             .id("user-menu-photo-clear")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.close_user_menu(cx);
-                                crate::settings::update(
-                                    crate::settings::SavePolicy::Immediate,
-                                    cx,
-                                    |settings| settings.profile_photo = None,
-                                );
+                                this.settings.profile_photo = None;
+                                this.schedule_save(cx);
                                 cx.notify();
                             }))
                             .child(
@@ -7751,6 +7760,11 @@ fn header_icon_button(
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.viewport_width = f32::from(window.viewport_size().width);
+        if std::mem::take(&mut self.settings_focus_pending)
+            && matches!(self.route, Route::Settings(_))
+        {
+            window.focus(&self.settings_focus, cx);
+        }
         // Appearance actions persist independently of the shell. Mirror the
         // globals before any later debounced settings save can overwrite them.
         self.settings.appearance = crate::appearance::mode(cx);

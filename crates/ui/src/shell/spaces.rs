@@ -2886,12 +2886,15 @@ impl Shell {
             let Some(path) = paths.into_iter().next() else {
                 return;
             };
-            this.update(cx, |_, cx| {
-                crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| {
-                    settings
-                        .space_icons
-                        .insert(space_id.clone(), path.to_string_lossy().into_owned());
-                });
+            this.update(cx, |shell, cx| {
+                // Through the shell's own copy: `schedule_save` writes the
+                // whole struct, so a field-level write beside it is undone by
+                // the next save.
+                shell
+                    .settings
+                    .space_icons
+                    .insert(space_id.clone(), path.to_string_lossy().into_owned());
+                shell.schedule_save(cx);
                 cx.notify();
             })
             .ok();
@@ -2901,9 +2904,8 @@ impl Shell {
     /// Drop a project's custom icon; the folder glyph comes back.
     pub(super) fn clear_space_icon(&mut self, space_id: String, cx: &mut Context<Self>) {
         self.close_space_menu(cx);
-        crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| {
-            settings.space_icons.remove(&space_id);
-        });
+        self.settings.space_icons.remove(&space_id);
+        self.schedule_save(cx);
         cx.notify();
     }
 
