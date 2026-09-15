@@ -48,6 +48,7 @@ pub mod pickers;
 pub mod popover;
 pub mod queue;
 pub mod rail;
+pub mod rewind;
 pub mod settings;
 pub mod shell;
 pub mod sound;
