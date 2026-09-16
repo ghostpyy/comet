@@ -3846,11 +3846,13 @@ impl Shell {
             return;
         }
         // Settings may have pointed the snapshot at another device; the chip
-        // speaks for this one, so take it back rather than wait out the TTL.
+        // speaks for the chat's own, so take it back rather than wait out the
+        // TTL.
         let state = self.state.read(cx);
-        if state.agent_usage_stale() || state.agent_accounts_target.is_some() {
+        let target = state.selected_chat_account_target();
+        if state.agent_usage_stale() || state.agent_accounts_target != target {
             self.state
-                .update(cx, |state, cx| state.load_agent_accounts(None, true, cx));
+                .update(cx, |state, cx| state.load_agent_accounts(target, true, cx));
         }
         if self.account_usage_poll.is_none() {
             self.account_usage_poll = Some(cx.spawn(async move |this, cx| {

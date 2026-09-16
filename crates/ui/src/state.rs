@@ -1793,11 +1793,22 @@ impl AppState {
         cx.notify();
     }
 
+    /// The device whose CLI logins the selected chat spends: `None` for this
+    /// one (no passthrough), else the chat's host. Every account read and
+    /// mutation for the open chat routes through this — a chat running on
+    /// another machine must never read or swap the credentials on this one.
+    pub fn selected_chat_account_target(&self) -> Option<String> {
+        let chat = self.selected_chat_row()?;
+        (Some(chat.device_id.as_str()) != self.local_device_id.as_deref())
+            .then(|| chat.device_id.clone())
+    }
+
     /// The live account driving `harness` — what a chat on that harness spends
-    /// against. `None` while the snapshot describes another device, so the
-    /// chip never attributes a remote login to this one.
+    /// against. `None` while the snapshot describes a different device than
+    /// the chat does, so the chip never attributes one machine's login to
+    /// another.
     pub fn active_account_for(&self, harness: HarnessId) -> Option<&AgentAccount> {
-        if self.agent_accounts_target.is_some() {
+        if self.agent_accounts_target != self.selected_chat_account_target() {
             return None;
         }
         self.agent_accounts
@@ -3254,6 +3265,55 @@ mod tests {
             status: None,
             continuation_of: None,
         }
+    }
+
+    #[test]
+    fn a_remote_chats_accounts_never_resolve_against_this_device() {
+        // The whole point of the target: a chat hosted elsewhere must not
+        // read — or, through `switch_account`, overwrite — the CLI login on
+        // this machine.
+        let mut state = AppState::new();
+        state.local_device_id = Some("local".into());
+        let mut remote = chat("c1", 0, None);
+        remote.device_id = "remote".into();
+        state.chats = vec![remote];
+        state.selected_chat = Some("c1".into());
+        assert_eq!(
+            state.selected_chat_account_target().as_deref(),
+            Some("remote")
+        );
+
+        let account = AgentAccount {
+            id: "a1".into(),
+            harness: HarnessId::ClaudeCode,
+            email: Some("someone@example.test".into()),
+            plan_label: None,
+            active: true,
+            usage_windows: Vec::new(),
+            display_name: None,
+            organization: None,
+            auth_kind: None,
+            switchable: true,
+            saved_at: None,
+        };
+        state.agent_accounts = Loadable::Ready(AgentAccountsSnapshot {
+            accounts: vec![account],
+            warnings: Vec::new(),
+        });
+
+        // A local snapshot answers for the local device, not this chat.
+        state.agent_accounts_target = None;
+        assert!(state.active_account_for(HarnessId::ClaudeCode).is_none());
+        // Once it describes the chat's own host, it is the right answer.
+        state.agent_accounts_target = Some("remote".into());
+        assert!(state.active_account_for(HarnessId::ClaudeCode).is_some());
+        // And a third device's snapshot is not, either.
+        state.agent_accounts_target = Some("other".into());
+        assert!(state.active_account_for(HarnessId::ClaudeCode).is_none());
+
+        // A chat on this device carries no passthrough.
+        state.chats[0].device_id = "local".into();
+        assert_eq!(state.selected_chat_account_target(), None);
     }
 
     #[test]

@@ -13,7 +13,7 @@ use gpui::{AnyElement, Hsla, SharedString, div, prelude::*, px};
 
 use zeron_proto::{AgentAccount, AgentUsageWindow, HarnessId};
 
-use crate::settings::accounts::{usage_color, usage_level};
+use crate::settings::accounts::{UsageLevel, usage_color, usage_level};
 use crate::theme::Theme;
 
 /// The one window worth the chip: the short rolling window when the plan has
@@ -56,14 +56,19 @@ pub fn remaining_label(used_fraction: f32) -> SharedString {
     format!("{}% left", (remaining * 100.0).round() as u32).into()
 }
 
-/// Colour for a usage fraction at this call site.
-pub fn level_color(fraction: f32, theme: &Theme) -> Hsla {
-    usage_color(usage_level(fraction), theme)
+/// The meter's fill. Restrained on purpose: a healthy window is quiet, and
+/// colour arrives only once the window is genuinely low — so the one warm bar
+/// in a card means something. The percentages beside it stay neutral
+/// everywhere, which is what keeps the meter's colour legible as a signal.
+pub fn meter_fill(used_fraction: f32, theme: &Theme) -> Hsla {
+    match usage_level(used_fraction) {
+        UsageLevel::Normal => theme.text_muted.opacity(0.55),
+        level => usage_color(level, theme).opacity(0.9),
+    }
 }
 
 /// A meter bar, taking the fraction **used** and drawing what is **left** —
-/// it drains as the window is spent, matching the label beside it. Colour
-/// still keys off usage, so a nearly-empty bar is the red one.
+/// it drains as the window is spent, matching the label beside it.
 ///
 /// Callers size it: the card's meters want a wider bar than a switch row.
 pub fn meter(used_fraction: f32, height: f32, theme: &Theme) -> AnyElement {
@@ -83,7 +88,7 @@ pub fn meter(used_fraction: f32, height: f32, theme: &Theme) -> AnyElement {
                     .w(gpui::relative(remaining.max(0.015)))
                     .h_full()
                     .rounded_full()
-                    .bg(level_color(used, theme).opacity(0.85)),
+                    .bg(meter_fill(used, theme)),
             )
         })
         .into_any_element()
