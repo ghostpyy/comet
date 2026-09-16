@@ -684,11 +684,7 @@ impl AccountsPage {
         now: DateTime<Utc>,
     ) -> AnyElement {
         let fraction = window.used_fraction.clamp(0.0, 1.0);
-        let level = usage_level(fraction);
-        let fill = usage_color(level, theme).opacity(match level {
-            UsageLevel::Normal => 0.8,
-            _ => 0.85,
-        });
+        let fill = crate::account_usage::meter_fill(fraction, theme);
         let reset = format_reset(window.resets_at, now);
         div()
             .flex()
@@ -1201,6 +1197,14 @@ impl Render for AccountsPage {
         let dialog = self.render_login_dialog(window.viewport_size(), cx);
         // Owned for the frame: the rows below need `&mut Context` for their
         // listeners, which rules out holding a borrow of the shared state.
+        // The shared snapshot moves with whoever last asked for it — the
+        // composer's account chip retargets it at the open chat's device.
+        // Take it back before rendering a row, or the header would name this
+        // page's device above another one's accounts, and the row actions
+        // would fire at a third.
+        if self.state.read(cx).agent_accounts_target != self.target_device {
+            self.load(force_usage_for(LoadTrigger::Mount), cx);
+        }
         let snapshot = self.state.read(cx).agent_accounts.clone();
         let refreshing = matches!(snapshot, Loadable::Loading);
         let account_count = snapshot

@@ -493,6 +493,12 @@ pub struct Pickers {
     /// list can refuse a second click while the CLI swaps credentials.
     switching_account: Option<String>,
     switch_account_task: Option<Task<()>>,
+    /// Last activation failure, shown in the card until the next attempt: a
+    /// locked credential store must not read as an ignored click.
+    account_error: Option<SharedString>,
+    /// The switch list is revealed by its own button, so the card opens on
+    /// the one account you are spending.
+    account_switch_open: bool,
     device_owner: Option<String>,
     target_generation: u64,
     open: popover::Popup<PickerKind>,
@@ -664,6 +670,8 @@ impl Pickers {
             space_owner,
             switching_account: None,
             switch_account_task: None,
+            account_error: None,
+            account_switch_open: false,
             device_owner,
             target_generation: 0,
             config: DraftConfig::default(),
@@ -1052,9 +1060,14 @@ impl Pickers {
             }
             // Non-forcing: the footer chip keeps the snapshot warm, and
             // opening a card must never make the provider probe.
-            PickerKind::Account => self.state.update(cx, |state, cx| {
-                state.load_agent_accounts(None, false, cx);
-            }),
+            PickerKind::Account => {
+                self.account_error = None;
+                self.account_switch_open = false;
+                self.state.update(cx, |state, cx| {
+                    let target = state.selected_chat_account_target();
+                    state.load_agent_accounts(target, false, cx);
+                });
+            }
             // Projects and devices are already synced state — nothing to load.
             PickerKind::Space | PickerKind::Device => {}
         }
@@ -2827,7 +2840,6 @@ impl Pickers {
         let account = self.usage_account(cx)?;
         let headline = usage::headline_window(&account.usage_windows)?;
         let open = self.open_kind() == Some(PickerKind::Account);
-        let tint = usage::level_color(headline.used_fraction, theme);
         Some(
             div()
                 .id("picker-account")
@@ -2860,9 +2872,11 @@ impl Pickers {
                 }))
                 .child(usage::brand_mark(account.harness, 12.0, theme))
                 .child(
+                    // Neutral, like every other footer chip: the meter in the
+                    // card is where a low window speaks up.
                     div()
                         .text_size(crate::typography::ui_rems(11.0))
-                        .text_color(tint)
+                        .text_color(theme.text_muted)
                         .child(usage::remaining_label(headline.used_fraction)),
                 ),
         )
@@ -2885,34 +2899,42 @@ impl Pickers {
             .map(|window| {
                 div()
                     .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.0))
+                    .flex_col()
+                    .gap(px(3.0))
                     .text_size(crate::typography::ui_rems(11.0))
-                    .text_color(theme.text_muted.opacity(0.7))
+                    .text_color(theme.text_muted)
                     .child(
                         div()
-                            .w(px(44.0))
-                            .flex_none()
-                            .truncate()
-                            .child(SharedString::from(window.label.clone())),
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .w(px(44.0))
+                                    .flex_none()
+                                    .truncate()
+                                    .child(SharedString::from(window.label.clone())),
+                            )
+                            .child(usage::meter(window.used_fraction, 4.0, &theme))
+                            .child(
+                                div()
+                                    .w(px(52.0))
+                                    .flex_none()
+                                    .text_right()
+                                    .child(usage::remaining_label(window.used_fraction)),
+                            ),
                     )
-                    .child(usage::meter(window.used_fraction, 4.0, &theme))
-                    .child(
-                        div()
-                            .w(px(52.0))
-                            .flex_none()
-                            .text_right()
-                            .text_color(usage::level_color(window.used_fraction, &theme))
-                            .child(usage::remaining_label(window.used_fraction)),
-                    )
+                    // The reset sits under its own meter, quiet: it answers
+                    // "when does this come back", not "how much is left".
                     .when_some(
                         crate::settings::accounts::format_reset(window.resets_at, now),
                         |el, reset| {
                             el.child(
                                 div()
-                                    .flex_none()
+                                    .pl(px(52.0))
                                     .truncate()
+                                    .text_size(crate::typography::ui_rems(10.0))
                                     .text_color(theme.text_faint)
                                     .child(SharedString::from(reset)),
                             )
@@ -2937,7 +2959,13 @@ impl Pickers {
             })
             .unwrap_or_default();
         let has_others = !others.is_empty();
-        let other_rows: Vec<AnyElement> = others
+        let switch_open = self.account_switch_open;
+        let switch_label = if switch_open {
+            "Hide accounts"
+        } else {
+            "Switch account"
+        };
+        let other_rows: Vec<AnyElement> = if switch_open { others } else { Vec::new() }
             .into_iter()
             .enumerate()
             .map(|(ix, other)| self.render_account_switch_row(other, ix, &theme, now, cx))
@@ -2988,30 +3016,51 @@ impl Pickers {
                         }
                     }),
             )
+            .when_some(self.account_error.clone(), |el, error| {
+                // A failed activation left the old account live — say so
+                // where the click happened, not nowhere.
+                el.child(
+                    div()
+                        .px(px(10.0))
+                        .pb(px(8.0))
+                        .text_size(crate::typography::ui_rems(11.0))
+                        .text_color(theme.danger.opacity(0.9))
+                        .child(error),
+                )
+            })
+            // Identity and usage first, actions last.
             .when(has_others, |el| {
                 el.child(popover::menu_separator()).child(
                     div()
-                        .px(px(2.0))
+                        .px(px(8.0))
+                        .py(px(7.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.0))
                         .child(
-                            div()
-                                .px(px(8.0))
-                                .pb(px(3.0))
-                                .text_size(crate::typography::ui_rems(10.5))
-                                .text_color(theme.text_faint)
-                                .child(SharedString::from("Switch account")),
+                            popover::btn_ghost(&theme, switch_label, "picker-account-switch")
+                                .id("picker-account-switch")
+                                .border_1()
+                                .border_color(theme.border)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.account_switch_open = !this.account_switch_open;
+                                    cx.notify();
+                                })),
                         )
-                        .child(
-                            // Capped so a long login list scrolls in the card
-                            // rather than growing past the window.
-                            div()
-                                .id("picker-account-others")
-                                .max_h(px(168.0))
-                                .overflow_y_scroll()
-                                .flex()
-                                .flex_col()
-                                .gap(px(1.0))
-                                .children(other_rows),
-                        ),
+                        .when(switch_open, |el| {
+                            el.child(
+                                // Capped so a long login list scrolls in the
+                                // card rather than growing past the window.
+                                div()
+                                    .id("picker-account-others")
+                                    .max_h(px(168.0))
+                                    .overflow_y_scroll()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(1.0))
+                                    .children(other_rows),
+                            )
+                        }),
                 )
             })
             .child(popover::menu_separator())
@@ -3019,6 +3068,7 @@ impl Pickers {
                 div().p(px(2.0)).child(
                     popover::menu_row(&theme, false, "picker-account-manage")
                         .id("picker-account-manage")
+                        .text_color(theme.text_muted)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.close(cx);
                             cx.emit(OpenAccountSettings);
@@ -3101,8 +3151,10 @@ impl Pickers {
                                 el.child(
                                     div()
                                         .flex_none()
+                                        .w(px(52.0))
+                                        .text_right()
                                         .text_size(crate::typography::ui_rems(11.0))
-                                        .text_color(usage::level_color(window.used_fraction, theme))
+                                        .text_color(theme.text_muted)
                                         .child(usage::remaining_label(window.used_fraction)),
                                 )
                             }),
@@ -3149,12 +3201,19 @@ impl Pickers {
             return;
         };
         self.switching_account = Some(account.id.clone());
+        self.account_error = None;
+        // The chat's own device, so a remote chat swaps ITS credentials and
+        // never the ones on this machine.
+        let target = self.state.read(cx).selected_chat_account_target();
         // Tolerant param shape, matching settings/accounts.rs.
-        let params = serde_json::json!({
+        let mut params = serde_json::json!({
             "id": account.id,
             "accountId": account.id,
             "harness": account.harness,
         });
+        if let Some(device) = target.clone() {
+            params["targetDeviceId"] = serde_json::Value::String(device);
+        }
         self.switch_account_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
@@ -3162,13 +3221,14 @@ impl Pickers {
                 .await;
             this.update(cx, |pickers, cx| {
                 pickers.switching_account = None;
-                if result.is_ok() {
+                match result {
                     // Activate already refreshed the credentials; the usage
                     // behind them is still warm, so ride the engine cache
                     // rather than re-probing the provider.
-                    pickers.state.update(cx, |state, cx| {
-                        state.load_agent_accounts(None, false, cx);
-                    });
+                    Ok(_) => pickers.state.update(cx, |state, cx| {
+                        state.load_agent_accounts(target, false, cx);
+                    }),
+                    Err(err) => pickers.account_error = Some(err.to_string().into()),
                 }
                 cx.notify();
             })
